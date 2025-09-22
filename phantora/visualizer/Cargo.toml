@@ -1,0 +1,17 @@
+[package]
+name = "visualizer"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+phantora = { path = "../phantora" }
+cuda_call = { path = "../cuda_call" }
+netsim = { path = "../netsim" }
+bincode = "1.3.3"
+serde = { version = "1.0.196", features = ["derive"] }
+clap = { version = "4.5.4", features = ["derive"] }
+log = "0.4.21"
+env_logger = "0.11.3"
+fnv = "1.0.7"
+serde_json = { version = "1.0.116", features = ["preserve_order"] }
+strum = { version = "0.26.2", features = ["derive"] }

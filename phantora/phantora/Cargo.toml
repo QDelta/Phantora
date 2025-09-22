@@ -1,0 +1,26 @@
+[package]
+name = "phantora"
+version = "0.0.1"
+edition = "2021"
+
+[dependencies]
+cuda_call = { path = "../cuda_call" }
+netsim = { path = "../netsim" }
+bincode = "1.3.3"
+ordered-float = "3.9.2"
+priority-queue = "1.4.0"
+tch = { git = "https://github.com/QDelta/tch-rs", branch = "fix-0.20.0" }
+serde_json = "1.0.113"
+serde = { version = "1.0.196", features = ["derive"] }
+serde-big-array = "0.5.1"
+lru = "0.12.2"
+libc = "0.2.153"
+clap = { version = "4.5.4", features = ["derive"] }
+log = "0.4.21"
+env_logger = "0.11.3"
+strum = { version = "0.26.2", features = ["derive"] }
+pyo3 = { version = "0.21.2", features = ["auto-initialize"] }
+
+[[bin]]
+name = "simulator"
+path = "src/main.rs"

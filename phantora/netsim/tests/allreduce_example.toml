@@ -1,0 +1,35 @@
+# Specifiation of a Allreduce application experiment
+
+# Output path of for the simulation results
+directory = "/tmp/phantora/allreduce_example"
+
+[simulator]
+loopback_speed = 400
+# possible values of fairness model are "PerFlowMaxMin", "PerVmPairMaxMin", and "TenantFlowMaxMin"
+fairness = "PerFlowMaxMin"
+
+# The topology for simulation
+[topology]
+type = "TwoLayerMultiPath"  # FatTree|Arbitrary|TwoLayerMultiPath
+
+# [topology.args] # When type = "FatTree"
+# nports = 20           # the number of ports of a switch
+# bandwidth = 100       # in Gbps
+# oversub_ratio = 4.0   # oversubscription ratio
+
+# [topology.args]         # When type = "Arbitrary"
+# nracks = 16        # the number of racks
+# rack_size = 16      # the number of hosts under a rack
+# host_bw = 1600       # bandwidth of a host, in Gbps
+# rack_bw = 25600       # bandwidth of a ToR switch, in Gbps
+
+[topology.args]    # When type = "TwoLayerMultiPath"
+nspines = 16
+nracks = 24
+rack_size = 4
+host_bw = 1600
+rack_uplink_port_bw = 200
+load_balancer_type = "EcmpEverything"  # EcmpEverything|EcmpSourcePort
+
+# [envs]
+# KEY = "value"

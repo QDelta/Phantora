@@ -1,0 +1,11 @@
+/build/*
+!/build/.gitkeep
+/dist/*
+!/dist/phantora_run
+/trace/*
+!/trace/.gitkeep
+
+.cache/
+/.venv/
+/.vscode/
+__pycache__/

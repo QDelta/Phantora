@@ -1,0 +1,4 @@
+/compose.yaml
+/netconfig.toml
+/hostfile
+/deepspeed_env

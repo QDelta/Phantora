@@ -1,0 +1,3 @@
+[workspace]
+members = ["cuda_call", "netsim", "phantora", "visualizer"]
+resolver = "2"

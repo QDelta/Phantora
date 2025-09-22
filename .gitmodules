@@ -1,0 +1,4 @@
+[submodule "pytorch"]
+	path = pytorch
+	url = https://github.com/QDelta/pytorch.git
+	branch = 2.7.1-phantora

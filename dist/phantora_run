@@ -1,0 +1,14 @@
+#!/bin/bash
+
+SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
+
+export LD_LIBRARY_PATH="$SCRIPT_DIR:$LD_LIBRARY_PATH"
+export LD_PRELOAD="$SCRIPT_DIR/libcuda.so.1"
+export PHANTORA=1
+# export PHANTORA_IGNORE_CPU_TIME=1
+# export PHANTORA_NGPU=4
+# export PHANTORA_VRAM_MIB=143771
+
+unset PYTORCH_CUDA_ALLOC_CONF
+
+"$@"
