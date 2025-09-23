@@ -80,8 +80,8 @@ If you use Phantora for your research, please cite our [paper](https://arxiv.org
 
 ```bibtex
 @misc{qin2025phantora,
-  title="{Phantora: Live GPU Cluster Simulation for Machine Learning System Performance Estimation}",
-  author={Jianxing Qin and Jingrong Chen and Xinhao Kong and Yongji Wu and Liang Luo and Zhaodong Wang and Ying Zhang and Tingjun Chen and Alvin R. Lebeck and Danyang Zhuo},
+  title="{Phantora: Maximizing Code Reuse in Simulation-based Machine Learning System Performance Estimation}",
+  author={Jianxing Qin and Jingrong Chen and Xinhao Kong and Yongji Wu and Tianjun Yuan and Liang Luo and Zhaodong Wang and Ying Zhang and Tingjun Chen and Alvin R. Lebeck and Danyang Zhuo},
   year={2025},
   eprint={2505.01616},
   archivePrefix={arXiv},
