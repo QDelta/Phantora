@@ -1,8 +1,10 @@
-# What is Phantora?
+## What is Phantora?
 
 Phantora is a *hybrid* GPU cluster simulator for ML system performance estimation.
 
-# Build Instructions
+For more details, please refer to our [paper](https://arxiv.org/abs/2505.01616).
+
+## Build Instructions
 
 Clone the repository via `git`.
 
@@ -22,7 +24,7 @@ It might take a while.
 
 If you want to build it locally without Docker, also refer to `Dockerfile` for the detailed commands.
 
-# Try our examples
+## Try our examples
 
 Once you built the `phantora` docker image, you can try our examples of distributed training using Megatron, DeepSpeed and TorchTitan. The examples will launch multiple containers (using Docker Compose) to simulate a GPU cluster.
 
@@ -71,3 +73,19 @@ if __name__ == "__main__":
 ```
 
 For other configurations, you can refer to generated configurations in `tests/docker/{megatron,deepspeed,torchtitan}`.
+
+## Citation
+
+If you use Phantora for your research, please cite our [paper](https://arxiv.org/abs/2505.01616).
+
+```bibtex
+@misc{qin2025phantora,
+  title="{Phantora: Live GPU Cluster Simulation for Machine Learning System Performance Estimation}",
+  author={Jianxing Qin and Jingrong Chen and Xinhao Kong and Yongji Wu and Liang Luo and Zhaodong Wang and Ying Zhang and Tingjun Chen and Alvin R. Lebeck and Danyang Zhuo},
+  year={2025},
+  eprint={2505.01616},
+  archivePrefix={arXiv},
+  primaryClass={cs.DC},
+  url={https://arxiv.org/abs/2505.01616},
+}
+```
