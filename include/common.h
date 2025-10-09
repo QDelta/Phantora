@@ -3,9 +3,7 @@
 #define _GNU_SOURCE
 
 #include <stdio.h>
-
-void
-exit(int);
+#include <stdlib.h>
 
 #define NOT_IMPLEMENTED                                                        \
     do {                                                                       \

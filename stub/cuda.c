@@ -10,7 +10,7 @@ load_original_func(const char* name)
     if (!lib) {
         lib = dlopen(LIBCUDA_PATH, RTLD_LAZY);
         if (!lib) {
-            fprintf(stderr, "DLOPEN: can not load \"%s\"", LIBCUDA_PATH);
+            fprintf(stderr, "DLOPEN: can not load \"%s\"\n", LIBCUDA_PATH);
             exit(1);
         }
     }

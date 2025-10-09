@@ -20,8 +20,8 @@
 
 static _Thread_local int CURRENT_DEVICE = 0;
 
-static atomic_int STREAM_COUNTER = 1;
-static atomic_int EVENT_COUNTER = 0;
+static atomic_int STREAM_COUNTER = ATOMIC_VAR_INIT(1);
+static atomic_int EVENT_COUNTER = ATOMIC_VAR_INIT(0);
 
 int
 _get_device_count()

@@ -77,8 +77,7 @@ impl TimelineReader {
         let mut len_buf = [0u8; 8];
         self.reader.read_exact(&mut len_buf)?;
         let len = u64::from_be_bytes(len_buf) as usize;
-        let mut buf = Vec::with_capacity(len);
-        unsafe { buf.set_len(len) };
+        let mut buf = vec![0u8; len];
         self.reader.read_exact(&mut buf)?;
         self.timeline_pos += 8 + len as u64;
         Ok(bincode::deserialize(&buf).unwrap())
@@ -152,7 +151,7 @@ impl Timeline {
     fn new() -> Self {
         Timeline {
             db: Default::default(),
-            min_ts: i64::max_value(),
+            min_ts: i64::MAX,
         }
     }
 
