@@ -9,3 +9,6 @@
 /.venv/
 /.vscode/
 __pycache__/
+*.rlib
+*.so
+*.o
