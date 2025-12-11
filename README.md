@@ -4,6 +4,8 @@ Phantora is a *hybrid* GPU cluster simulator for ML system performance estimatio
 
 For more details, please refer to our [paper](https://arxiv.org/abs/2505.01616).
 
+Phantora is accepted by **NSDI 2026** 🎉
+
 ## Build Instructions
 
 Clone the repository via `git`.
