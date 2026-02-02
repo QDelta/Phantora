@@ -22,6 +22,7 @@ else:
     LIB.get_time_double.restype = ctypes.c_double
     _get_time = LIB.get_time_double
     _perf_counter = _time.perf_counter
+    _wall_time = _time.time
 
     def time() -> float:
         _read_timer()
@@ -34,6 +35,7 @@ else:
         return t, t_wall
 
     _time.perf_counter = time
+    _time.time = time
 
     # seems cannot patch `assert_ints_same_as_other_ranks`
     # maybe due to decorator, but cannot reproduce in a mini example
