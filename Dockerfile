@@ -52,6 +52,10 @@ RUN curl -Lo torchtitan-requirements.txt https://raw.githubusercontent.com/pytor
     python3 -m pip install --no-cache-dir -r torchtitan-requirements.txt
 RUN python3 -m pip install --no-cache-dir megatron-core==0.13.1 transformers==4.41.2 deepspeed==0.17.5 torchtitan==0.1.0
 
+RUN python3 -m pip install --no-cache-dir --no-deps colossalai==0.5.0
+RUN python3 -m pip install --no-cache-dir peft==0.10.0
+RUN python3 -m pip install --no-cache-dir galore-torch
+
 # DeepSpeed needs passwordless ssh
 COPY config/sshconfig /root/.ssh/config
 COPY config/id_ed25519 /root/.ssh/id_ed25519
