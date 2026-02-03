@@ -54,7 +54,7 @@ RUN python3 -m pip install --no-cache-dir megatron-core==0.13.1 transformers==4.
 
 RUN python3 -m pip install --no-cache-dir --no-deps colossalai==0.5.0
 RUN python3 -m pip install --no-cache-dir peft==0.10.0
-RUN python3 -m pip install --no-cache-dir galore-torch
+RUN python3 -m pip install --no-cache-dir galore-torch==1.0
 
 # DeepSpeed needs passwordless ssh
 COPY config/sshconfig /root/.ssh/config
