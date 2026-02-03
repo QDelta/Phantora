@@ -35,8 +35,7 @@ else:
         return t, t_wall
 
     _time.perf_counter = time
-    # Not sure if there should be patch
-    # _time.time = time
+    #_time.time = time
 
     # seems cannot patch `assert_ints_same_as_other_ranks`
     # maybe due to decorator, but cannot reproduce in a mini example
