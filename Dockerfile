@@ -1,4 +1,4 @@
-FROM nvidia/cuda:11.8.0-devel-ubuntu22.04 AS phantora-pytorch
+FROM nvidia/cuda:12.6.3-devel-ubuntu22.04 AS phantora-pytorch
 
 RUN apt-get update && \
     DEBIAN_FRONTEND=noninteractive \
@@ -28,7 +28,7 @@ ENV CUDA_HOME=/usr/local/cuda
 ENV LD_LIBRARY_PATH=$CUDA_HOME/lib64:$LD_LIBRARY_PATH
 ENV TORCH_CUDA_ARCH_LIST="8.0;9.0"
 ENV TORCH_NVCC_FLAGS="-Xfatbin -compress-all"
-ENV PYTORCH_BUILD_VERSION=2.7.1
+ENV PYTORCH_BUILD_VERSION=2.9.0
 ENV PYTORCH_BUILD_NUMBER=1
 ENV USE_CUDNN=0
 ENV USE_CUSPARSELT=0
