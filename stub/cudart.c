@@ -555,12 +555,24 @@ _dummy() // accept any number of arguments
 }
 
 cudaError_t
+#if CUDART_VERSION >= 12000
+cudaGetDriverEntryPoint(const char* symbol,
+                        void** funcPtr,
+                        unsigned long long flags,
+                        enum cudaDriverEntryPointQueryResult* driverStatus)
+#else
 cudaGetDriverEntryPoint(const char* symbol,
                         void** funcPtr,
                         unsigned long long flags)
+#endif
 {
     // TODO
     *funcPtr = _dummy;
+#if CUDART_VERSION >= 12000
+    if (driverStatus) {
+        *driverStatus = cudaDriverEntryPointSuccess;
+    }
+#endif
     return cudaSuccess;
 }
 

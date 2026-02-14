@@ -232,13 +232,23 @@ cudaStreamEndCapture(cudaStream_t stream, cudaGraph_t* pGraph)
 }
 
 cudaError_t
+#if CUDART_VERSION >= 12000
+cudaStreamGetCaptureInfo(cudaStream_t stream,
+                         enum cudaStreamCaptureStatus* captureStatus_out,
+                         unsigned long long* id_out,
+                         cudaGraph_t* graph_out,
+                         const cudaGraphNode_t** dependencies_out,
+                         size_t* numDependencies_out)
+#else
 cudaStreamGetCaptureInfo(cudaStream_t stream,
                          enum cudaStreamCaptureStatus* pCaptureStatus,
                          unsigned long long* pId)
+#endif
 {
     NOT_IMPLEMENTED;
 }
 
+#if CUDART_VERSION < 12000
 cudaError_t
 cudaStreamGetCaptureInfo_v2(cudaStream_t stream,
                             enum cudaStreamCaptureStatus* captureStatus_out,
@@ -249,6 +259,7 @@ cudaStreamGetCaptureInfo_v2(cudaStream_t stream,
 {
     NOT_IMPLEMENTED;
 }
+#endif
 
 cudaError_t
 cudaStreamUpdateCaptureDependencies(cudaStream_t stream,
@@ -270,7 +281,8 @@ cudaEventRecordWithFlags(cudaEvent_t event,
                          cudaStream_t stream,
                          unsigned int flags)
 {
-    NOT_IMPLEMENTED;
+    (void)flags;
+    return cudaEventRecord(event, stream);
 }
 
 cudaError_t
@@ -1687,11 +1699,17 @@ cudaGraphDestroyNode(cudaGraphNode_t node)
 }
 
 cudaError_t
+#if CUDART_VERSION >= 12000
+cudaGraphInstantiate(cudaGraphExec_t* pGraphExec,
+                     cudaGraph_t graph,
+                     unsigned long long flags)
+#else
 cudaGraphInstantiate(cudaGraphExec_t* pGraphExec,
                      cudaGraph_t graph,
                      cudaGraphNode_t* pErrorNode,
                      char* pLogBuffer,
                      size_t bufferSize)
+#endif
 {
     NOT_IMPLEMENTED;
 }
@@ -1852,10 +1870,16 @@ cudaGraphNodeGetEnabled(cudaGraphExec_t hGraphExec,
 #endif
 
 cudaError_t
+#if CUDART_VERSION >= 12000
+cudaGraphExecUpdate(cudaGraphExec_t hGraphExec,
+                    cudaGraph_t hGraph,
+                    cudaGraphExecUpdateResultInfo* resultInfo)
+#else
 cudaGraphExecUpdate(cudaGraphExec_t hGraphExec,
                     cudaGraph_t hGraph,
                     cudaGraphNode_t* hErrorNode_out,
                     enum cudaGraphExecUpdateResult* updateResult_out)
+#endif
 {
     NOT_IMPLEMENTED;
 }
