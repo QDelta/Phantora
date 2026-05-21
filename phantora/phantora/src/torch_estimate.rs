@@ -254,6 +254,61 @@ impl TorchEstimator {
                 );
                 dur
             }
+            TorchCallInfo::MaskedFill(info, mask_info) => {
+                let t = self.allocate(info);
+                let mask = self.allocate(mask_info);
+                let (result, dur) = estimate_torch!(niter, t.masked_fill(&mask, -10000.0));
+                self.cache(result);
+                dur
+            }
+            TorchCallInfo::MaskedFill_(info, mask_info) => {
+                let mut t = self.allocate(info);
+                let mask = self.allocate(mask_info);
+                let (result, dur) = estimate_torch!(niter, t.masked_fill_(&mask, -10000.0));
+                self.cache(result);
+                dur
+            }
+            TorchCallInfo::Dropout(info, p_millionths, train) => {
+                let t = self.allocate(info);
+                let (result, dur) =
+                    estimate_torch!(niter, t.dropout(*p_millionths as f64 / 1_000_000.0, *train));
+                self.cache(result);
+                dur
+            }
+            TorchCallInfo::NativeDropout(info, p_millionths, train) => {
+                let t = self.allocate(info);
+                let ((result, mask), dur) = estimate_torch!(
+                    niter,
+                    t.native_dropout(*p_millionths as f64 / 1_000_000.0, *train)
+                );
+                self.cache(result);
+                self.cache(mask);
+                dur
+            }
+            TorchCallInfo::NativeDropoutBackward(grad_info, mask_info, scale_millionths) => {
+                let grad = self.allocate(grad_info);
+                let mask = self.allocate(mask_info);
+                let (result, dur) = estimate_torch!(
+                    niter,
+                    Tensor::native_dropout_backward(
+                        &grad,
+                        &mask,
+                        *scale_millionths as f64 / 1_000_000.0
+                    )
+                );
+                self.cache(result);
+                dur
+            }
+            TorchCallInfo::FusedDropout(info, p_millionths) => {
+                let t = self.allocate(info);
+                let ((result, mask), dur) = estimate_torch!(
+                    niter,
+                    t.internal_fused_dropout(*p_millionths as f64 / 1_000_000.0)
+                );
+                self.cache(result);
+                self.cache(mask);
+                dur
+            }
             TorchCallInfo::Where(info1, info2, info3) => {
                 let t1 = self.allocate(info1);
                 let t2 = self.allocate(info2);
@@ -266,6 +321,25 @@ impl TorchEstimator {
                 let t1 = self.allocate(info1);
                 let t2 = self.allocate(info2);
                 let (result, dur) = estimate_torch!(niter, t2.where_scalarother(&t1, 1));
+                self.cache(result);
+                dur
+            }
+            TorchCallInfo::Gelu(info) => {
+                let t = self.allocate(info);
+                let (result, dur) = estimate_torch!(niter, t.gelu("none"));
+                self.cache(result);
+                dur
+            }
+            TorchCallInfo::GeluBackward(grad_info, input_info) => {
+                let grad = self.allocate(grad_info);
+                let input = self.allocate(input_info);
+                let (result, dur) = estimate_torch!(niter, input.gelu_backward(&grad, "none"));
+                self.cache(result);
+                dur
+            }
+            TorchCallInfo::Sum(info) => {
+                let t = self.allocate(info);
+                let (result, dur) = estimate_torch!(niter, t.sum(info.dtype));
                 self.cache(result);
                 dur
             }
