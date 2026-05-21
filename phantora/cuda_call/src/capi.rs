@@ -705,7 +705,12 @@ impl NcclCaller {
         }
         if self.group_counter == 0 {
             let mut responsed_calls = Vec::new();
+            let mut p2p_calls = Vec::new();
             for call in self.grouped_calls.drain(..) {
+                if matches!(call, CudaCall::NcclSend { .. } | CudaCall::NcclRecv { .. }) {
+                    p2p_calls.push(call);
+                    continue;
+                }
                 if let CudaCall::NcclCommInitRank { nranks, .. } = &call {
                     if *nranks > 1 {
                         responsed_calls.push(call.clone());
@@ -717,6 +722,9 @@ impl NcclCaller {
                 } else {
                     send_cuda_call(call);
                 }
+            }
+            if !p2p_calls.is_empty() {
+                send_cuda_call(CudaCall::NcclP2pGroup { calls: p2p_calls });
             }
             for call in responsed_calls {
                 match call {
@@ -922,6 +930,50 @@ pub extern "C" fn nccl_reduce_scatter(
             count,
             dtype: enum_to_nccl_datatype(dtype),
             op: enum_to_nccl_reduce_op(op),
+            comm: NcclComm { rank, id },
+            stream: CudaStream { device, id: stream },
+        })
+    });
+}
+
+#[no_mangle]
+pub extern "C" fn nccl_send(
+    count: usize,
+    dtype: i32,
+    peer: i32,
+    comm_id: *const ffi::c_char,
+    rank: i32,
+    device: i32,
+    stream: i32,
+) {
+    let id = get_comm_id(comm_id);
+    NCCL_CALLER.with_borrow_mut(|caller| {
+        caller.call(CudaCall::NcclSend {
+            count,
+            dtype: enum_to_nccl_datatype(dtype),
+            peer,
+            comm: NcclComm { rank, id },
+            stream: CudaStream { device, id: stream },
+        })
+    });
+}
+
+#[no_mangle]
+pub extern "C" fn nccl_recv(
+    count: usize,
+    dtype: i32,
+    peer: i32,
+    comm_id: *const ffi::c_char,
+    rank: i32,
+    device: i32,
+    stream: i32,
+) {
+    let id = get_comm_id(comm_id);
+    NCCL_CALLER.with_borrow_mut(|caller| {
+        caller.call(CudaCall::NcclRecv {
+            count,
+            dtype: enum_to_nccl_datatype(dtype),
+            peer,
             comm: NcclComm { rank, id },
             stream: CudaStream { device, id: stream },
         })

@@ -115,7 +115,7 @@ pub type CommMeta = CudaCall;
 #[repr(transparent)]
 pub struct NodeId(pub HostId);
 
-#[derive(PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(transparent)]
 pub struct NcclId(pub [u8; 128]);
 
@@ -140,6 +140,46 @@ struct SplitInfo {
 struct SplitWaiting {
     joined_ranks: HashMap<i32, SplitInfo>,
     waiting_for: HashSet<i32>,
+}
+
+type P2PKey = (NcclId, i32, i32);
+
+#[derive(Clone, Copy)]
+enum P2PCallKind {
+    Send,
+    Recv,
+}
+
+struct P2PCallInfo {
+    kind: P2PCallKind,
+    key: P2PKey,
+    stream: CudaStream,
+    count: usize,
+    dtype: NcclDatatype,
+}
+
+struct P2PFlowEndpoint {
+    host: HostId,
+    stream: CudaStream,
+    curr_time: i64,
+    count: usize,
+    dtype: NcclDatatype,
+    // Nodes that gate this one matched network flow.
+    //
+    // Ungrouped P2P: these are real stream-ordered start/end points created with
+    // `add_event`, so the CUDA stream is occupied until the matched flow ends.
+    //
+    // Grouped P2P: these are raw off-stream flow_start/flow_end points created
+    // with `add_action_or_point`.  The stream-visible group_start/group_end
+    // shell is separate, which lets multiple internal flows run concurrently
+    // instead of being serialized by CUDA stream order.
+    flow_start: EventId,
+    flow_end: EventId,
+    // Keeps this local flow endpoint from starting before it has found a peer.
+    // Both grouped and ungrouped P2P create one unmatched barrier per endpoint;
+    // matching releases the two endpoint barriers and then the scheduled flow is
+    // gated by both sides' flow_start points.
+    unmatched_barrier: EventId,
 }
 
 struct CCWaiting {
@@ -172,6 +212,10 @@ pub struct Simulator {
     allreduce_waiting: HashMap<NcclId, VecDeque<CCWaiting>>,
     allgather_waiting: HashMap<NcclId, VecDeque<CCWaiting>>,
     reduce_scatter_waiting: HashMap<NcclId, VecDeque<CCWaiting>>,
+    // P2P key = (comm_id, sender_rank, receiver_rank). FIFO queues preserve
+    // NCCL's peer ordering for repeated sends/receives.
+    send_waiting: HashMap<P2PKey, VecDeque<P2PFlowEndpoint>>,
+    recv_waiting: HashMap<P2PKey, VecDeque<P2PFlowEndpoint>>,
 }
 
 fn incr_nccl_id(id: &mut [u8; 128]) -> [u8; 128] {
@@ -230,6 +274,8 @@ impl Simulator {
             allreduce_waiting: HashMap::new(),
             allgather_waiting: HashMap::new(),
             reduce_scatter_waiting: HashMap::new(),
+            send_waiting: HashMap::new(),
+            recv_waiting: HashMap::new(),
         }
     }
 
@@ -513,6 +559,21 @@ impl Simulator {
                 comm,
                 stream,
             ),
+            CudaCall::NcclSend {
+                count,
+                dtype,
+                peer,
+                comm,
+                stream,
+            } => self.nccl_ungrouped_send(host.host, curr_time, count, dtype, peer, comm, stream),
+            CudaCall::NcclRecv {
+                count,
+                dtype,
+                peer,
+                comm,
+                stream,
+            } => self.nccl_ungrouped_recv(host.host, curr_time, count, dtype, peer, comm, stream),
+            CudaCall::NcclP2pGroup { calls } => self.nccl_grouped_p2p(host.host, curr_time, calls),
 
             CudaCall::ReadTimer(stream) => {
                 self.read_timer(host, curr_time, stream);
@@ -950,6 +1011,368 @@ impl Simulator {
                 .unwrap(),
             );
         }
+    }
+
+    fn nccl_ungrouped_send(
+        &mut self,
+        host: HostId,
+        curr_time: i64,
+        count: usize,
+        dtype: NcclDatatype,
+        peer: i32,
+        comm: NcclComm,
+        stream: CudaStream,
+    ) {
+        self.nccl_ungrouped_p2p(
+            P2PCallKind::Send,
+            host,
+            curr_time,
+            count,
+            dtype,
+            peer,
+            comm,
+            stream,
+        );
+    }
+
+    fn nccl_ungrouped_recv(
+        &mut self,
+        host: HostId,
+        curr_time: i64,
+        count: usize,
+        dtype: NcclDatatype,
+        peer: i32,
+        comm: NcclComm,
+        stream: CudaStream,
+    ) {
+        self.nccl_ungrouped_p2p(
+            P2PCallKind::Recv,
+            host,
+            curr_time,
+            count,
+            dtype,
+            peer,
+            comm,
+            stream,
+        );
+    }
+
+    fn nccl_ungrouped_p2p(
+        &mut self,
+        kind: P2PCallKind,
+        host: HostId,
+        curr_time: i64,
+        count: usize,
+        dtype: NcclDatatype,
+        peer: i32,
+        comm: NcclComm,
+        stream: CudaStream,
+    ) {
+        // Ungrouped NCCL P2P is stream ordered: one send/recv call occupies its
+        // CUDA stream until the matched network flow completes.  Each endpoint
+        // owns a private zero-time barrier, so the same match/enqueue helper can
+        // either store this endpoint or match it and release both barriers.
+        let key = Self::p2p_key(kind, comm, peer);
+        let unmatched_barrier = self.queue.add_action_or_point(vec![None], None, curr_time);
+        let endpoint = self.create_ungrouped_p2p_endpoint(
+            host,
+            stream,
+            curr_time,
+            count,
+            dtype,
+            unmatched_barrier,
+        );
+        self.match_or_enqueue_p2p_endpoint(kind, key, endpoint);
+    }
+
+    fn nccl_grouped_p2p(&mut self, host: HostId, curr_time: i64, calls: Vec<CudaCall>) {
+        let mut calls_by_stream: HashMap<CudaStream, Vec<P2PCallInfo>> = HashMap::new();
+        for call in calls {
+            let call_info = match call {
+                CudaCall::NcclSend {
+                    count,
+                    dtype,
+                    peer,
+                    comm,
+                    stream,
+                } => Some(P2PCallInfo {
+                    kind: P2PCallKind::Send,
+                    key: Self::p2p_key(P2PCallKind::Send, comm, peer),
+                    stream,
+                    count,
+                    dtype,
+                }),
+                CudaCall::NcclRecv {
+                    count,
+                    dtype,
+                    peer,
+                    comm,
+                    stream,
+                } => Some(P2PCallInfo {
+                    kind: P2PCallKind::Recv,
+                    key: Self::p2p_key(P2PCallKind::Recv, comm, peer),
+                    stream,
+                    count,
+                    dtype,
+                }),
+                other => {
+                    log::warn!("Ignoring non-P2P call in NcclP2pGroup: {:?}", other);
+                    None
+                }
+            };
+            if let Some(call_info) = call_info {
+                calls_by_stream
+                    .entry(call_info.stream)
+                    .or_default()
+                    .push(call_info);
+            }
+        }
+        if calls_by_stream.is_empty() {
+            return;
+        }
+
+        // Grouped NCCL P2P is modeled as a single stream-visible grouped op per
+        // stream, plus independent raw DAG communication flows.
+        //
+        // The group start/end points preserve CUDA stream semantics:
+        //   previous stream work -> group_start -> group_end -> following work
+        //
+        // Individual P2P flows are *not* stream events.  A matched pair creates a
+        // raw Action::Communication node between off-stream flow_start/flow_end
+        // points, so flow A may run while flow B is still unmatched.
+        //
+        // Each stream group has:
+        //   group_barrier -> prevents internal flow points from firing while the
+        //                    group's DAG is still being constructed.
+        //   group_start   -> stream-ordered start of the fused grouped NCCL op.
+        //   group_end     -> stream-ordered end; following stream work waits here.
+        //
+        // Each P2P call in the group has:
+        //   unmatched_barrier -> held until this call matches its peer.
+        //   flow_start/end    -> raw DAG points, not stream events.
+        //
+        // Once the setup is complete, group_barrier is released.  Matching a pair
+        // releases only the two per-call unmatched barriers and attaches the real
+        // flow events to the corresponding flow_end points.  Since group_end
+        // depends on every flow_end, the stream advances only after all internal
+        // transfers finish.
+        for (stream, grouped_calls) in calls_by_stream {
+            let group_barrier = self.queue.add_action_or_point(vec![None], None, curr_time);
+            let group_start = Self::add_event(
+                &mut self.torch_estimator,
+                &mut self.stream_info,
+                &mut self.queue,
+                (host.clone(), stream),
+                vec![Some(group_barrier)],
+                None,
+                curr_time,
+            );
+
+            let mut flow_setups = Vec::new();
+            for call in grouped_calls {
+                let unmatched_barrier = self.queue.add_action_or_point(vec![None], None, curr_time);
+                // Internal grouped flows are raw DAG points, not stream events:
+                // the per-flow barrier controls matching, while group_end below
+                // is the only stream-visible join for following work.
+                let flow_start = self.queue.add_action_or_point(
+                    vec![Some(group_start), Some(unmatched_barrier)],
+                    None,
+                    curr_time,
+                );
+                let flow_end =
+                    self.queue
+                        .add_action_or_point(vec![Some(flow_start)], None, curr_time);
+                flow_setups.push((call, unmatched_barrier, flow_start, flow_end));
+            }
+
+            let mut group_end_dependencies = vec![Some(group_start)];
+            group_end_dependencies.extend(
+                flow_setups
+                    .iter()
+                    .map(|(_, _, _, flow_end)| Some(*flow_end)),
+            );
+            Self::add_event(
+                &mut self.torch_estimator,
+                &mut self.stream_info,
+                &mut self.queue,
+                (host.clone(), stream),
+                group_end_dependencies,
+                None,
+                curr_time,
+            );
+
+            for (call, unmatched_barrier, flow_start, flow_end) in flow_setups {
+                let endpoint = P2PFlowEndpoint {
+                    host: host.clone(),
+                    stream: call.stream,
+                    curr_time,
+                    count: call.count,
+                    dtype: call.dtype,
+                    flow_start,
+                    flow_end,
+                    unmatched_barrier,
+                };
+                self.match_or_enqueue_p2p_endpoint(call.kind, call.key, endpoint);
+            }
+
+            self.queue.remove_none_dependency(group_barrier);
+        }
+    }
+
+    fn p2p_key(kind: P2PCallKind, comm: NcclComm, peer: i32) -> P2PKey {
+        match kind {
+            P2PCallKind::Send => (NcclId(comm.id), comm.rank, peer),
+            P2PCallKind::Recv => (NcclId(comm.id), peer, comm.rank),
+        }
+    }
+
+    fn create_ungrouped_p2p_endpoint(
+        &mut self,
+        host: HostId,
+        stream: CudaStream,
+        curr_time: i64,
+        count: usize,
+        dtype: NcclDatatype,
+        unmatched_barrier: EventId,
+    ) -> P2PFlowEndpoint {
+        let flow_start = Self::add_event(
+            &mut self.torch_estimator,
+            &mut self.stream_info,
+            &mut self.queue,
+            (host.clone(), stream),
+            vec![Some(unmatched_barrier)],
+            None,
+            curr_time,
+        );
+        let flow_end = Self::add_event(
+            &mut self.torch_estimator,
+            &mut self.stream_info,
+            &mut self.queue,
+            (host.clone(), stream),
+            vec![Some(flow_start)],
+            None,
+            curr_time,
+        );
+
+        P2PFlowEndpoint {
+            host,
+            stream,
+            curr_time,
+            count,
+            dtype,
+            flow_start,
+            flow_end,
+            unmatched_barrier,
+        }
+    }
+
+    fn match_or_enqueue_p2p_endpoint(
+        &mut self,
+        kind: P2PCallKind,
+        key: P2PKey,
+        endpoint: P2PFlowEndpoint,
+    ) {
+        if let Some(peer_endpoint) = self.pop_matching_peer_endpoint(kind, &key) {
+            self.schedule_matched_p2p_flow(kind, endpoint, peer_endpoint, &key);
+        } else {
+            self.enqueue_unmatched_p2p_endpoint(kind, key, endpoint);
+        }
+    }
+
+    fn pop_matching_peer_endpoint(
+        &mut self,
+        kind: P2PCallKind,
+        key: &P2PKey,
+    ) -> Option<P2PFlowEndpoint> {
+        match kind {
+            P2PCallKind::Send => Self::pop_p2p_endpoint(&mut self.recv_waiting, key),
+            P2PCallKind::Recv => Self::pop_p2p_endpoint(&mut self.send_waiting, key),
+        }
+    }
+
+    fn pop_p2p_endpoint(
+        waiting_map: &mut HashMap<P2PKey, VecDeque<P2PFlowEndpoint>>,
+        key: &P2PKey,
+    ) -> Option<P2PFlowEndpoint> {
+        let endpoint = waiting_map.get_mut(key).and_then(|queue| queue.pop_front());
+        if waiting_map.get(key).map_or(false, |queue| queue.is_empty()) {
+            waiting_map.remove(key);
+        }
+        endpoint
+    }
+
+    fn enqueue_unmatched_p2p_endpoint(
+        &mut self,
+        kind: P2PCallKind,
+        key: P2PKey,
+        endpoint: P2PFlowEndpoint,
+    ) {
+        let waiting_map = match kind {
+            P2PCallKind::Send => &mut self.send_waiting,
+            P2PCallKind::Recv => &mut self.recv_waiting,
+        };
+        waiting_map.entry(key).or_default().push_back(endpoint);
+    }
+
+    fn schedule_matched_p2p_flow(
+        &mut self,
+        kind: P2PCallKind,
+        endpoint: P2PFlowEndpoint,
+        peer_endpoint: P2PFlowEndpoint,
+        key: &P2PKey,
+    ) {
+        let (send_endpoint, recv_endpoint) = match kind {
+            P2PCallKind::Send => (endpoint, peer_endpoint),
+            P2PCallKind::Recv => (peer_endpoint, endpoint),
+        };
+        Self::schedule_p2p_flow(&mut self.queue, send_endpoint, recv_endpoint, key);
+    }
+
+    fn release_unmatched_p2p_barrier(queue: &mut EventQueue, endpoint: &P2PFlowEndpoint) {
+        queue.remove_none_dependency(endpoint.unmatched_barrier);
+    }
+
+    fn schedule_p2p_flow(
+        queue: &mut EventQueue,
+        send: P2PFlowEndpoint,
+        recv: P2PFlowEndpoint,
+        key: &P2PKey,
+    ) {
+        let send_bytes = send.count * send.dtype.size();
+        let recv_bytes = recv.count * recv.dtype.size();
+        if send_bytes != recv_bytes {
+            log::warn!(
+                "Mismatched NCCL P2P sizes for {}->{}: send={} recv={}",
+                key.1,
+                key.2,
+                send_bytes,
+                recv_bytes
+            );
+        }
+        let flow = netsim::Flow::new(send_bytes, &send.host.hostname, &recv.host.hostname, None);
+
+        let curr_time = send.curr_time.max(recv.curr_time);
+        let flow_event = queue.add_action_or_point(
+            vec![Some(send.flow_start), Some(recv.flow_start)],
+            Some(Action::Communication(
+                flow,
+                CudaCall::NcclSend {
+                    count: send_bytes,
+                    dtype: NcclDatatype::U8,
+                    peer: key.2,
+                    comm: NcclComm {
+                        rank: key.1,
+                        id: key.0 .0,
+                    },
+                    stream: send.stream.clone(),
+                },
+            )),
+            curr_time,
+        );
+        queue.add_dependency(send.flow_end, Some(flow_event));
+        queue.add_dependency(recv.flow_end, Some(flow_event));
+        Self::release_unmatched_p2p_barrier(queue, &send);
+        Self::release_unmatched_p2p_barrier(queue, &recv);
     }
 
     fn nccl_call(

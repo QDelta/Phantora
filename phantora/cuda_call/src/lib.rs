@@ -186,6 +186,23 @@ pub enum CudaCall {
         comm: NcclComm,
         stream: CudaStream,
     },
+    NcclSend {
+        count: usize,
+        dtype: NcclDatatype,
+        peer: i32,
+        comm: NcclComm,
+        stream: CudaStream,
+    },
+    NcclRecv {
+        count: usize,
+        dtype: NcclDatatype,
+        peer: i32,
+        comm: NcclComm,
+        stream: CudaStream,
+    },
+    NcclP2pGroup {
+        calls: Vec<CudaCall>,
+    },
 
     ReadTimer(CudaStream),
 }
