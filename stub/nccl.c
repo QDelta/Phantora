@@ -339,7 +339,10 @@ ncclSend(const void* sendbuff,
          ncclComm_t comm,
          cudaStream_t stream)
 {
-    NOT_IMPLEMENTED;
+    struct phantora_cudaStream stream_ = phantora_cudaStream(stream);
+    nccl_send(
+      count, datatype, peer, comm->id, comm->rank, stream_.device, stream_.id);
+    return ncclSuccess;
 }
 
 ncclResult_t
@@ -350,5 +353,8 @@ ncclRecv(void* recvbuff,
          ncclComm_t comm,
          cudaStream_t stream)
 {
-    NOT_IMPLEMENTED;
+    struct phantora_cudaStream stream_ = phantora_cudaStream(stream);
+    nccl_recv(
+      count, datatype, peer, comm->id, comm->rank, stream_.device, stream_.id);
+    return ncclSuccess;
 }

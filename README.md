@@ -43,10 +43,10 @@ Phantora ships a stub `libnccl.so` that intercepts NCCL calls and forwards them 
 | `ncclBcast` (legacy in-place API) | ✅ Supported |
 | `ncclBroadcast` | ❌ Not implemented |
 | `ncclReduce` | ❌ Not implemented |
-| `ncclSend` (point-to-point) | 🚧 Work in progress |
-| `ncclRecv` (point-to-point) | 🚧 Work in progress |
+| `ncclSend` (point-to-point) | ✅ Supported |
+| `ncclRecv` (point-to-point) | ✅ Supported |
 
-`ncclSend` / `ncclRecv` are actively being worked on — once they land, pipeline parallelism and (via grouped point-to-point) expert parallelism / all-to-all will become simulatable across all three frameworks.
+`ncclSend` / `ncclRecv` are simulated for timing and stream ordering, including calls batched by `ncclGroupStart` / `ncclGroupEnd`. Phantora does not copy tensor payloads between ranks; receive buffers contain whatever simulated CUDA memory already holds. Framework paths that inspect data sent over NCCL, including shape or dtype metadata encoded in tensors, may still fail or diverge.
 
 **Communicator, group, and utility calls**
 
@@ -66,7 +66,7 @@ The full set of stubs lives in [`stub/nccl.c`](stub/nccl.c). Pull requests to ex
 
 ### Framework feature support
 
-The matrix below summarises which features of each supported framework Phantora can simulate today. A 🚧 row maps to a missing underlying collective in the NCCL table above, or to a separate communication library that Phantora does not yet intercept.
+The matrix below summarises which features of each supported framework Phantora can simulate today. A 🚧 row maps to an unsupported API, missing communication semantics, or a separate communication library that Phantora does not yet intercept.
 
 | Feature | Megatron | DeepSpeed | TorchTitan | Required collective(s) |
 | --- | :---: | :---: | :---: | --- |
@@ -75,12 +75,12 @@ The matrix below summarises which features of each supported framework Phantora 
 | ZeRO-1 / ZeRO-2 / ZeRO-3 | — | ✅ | — | AllReduce, AllGather, ReduceScatter |
 | FSDP / FSDP2 | — | — | ✅ | AllGather, ReduceScatter |
 | Activation checkpointing | ✅ | ✅ | ✅ | (no extra communication) |
-| Pipeline parallelism (PP) | 🚧 | 🚧 | 🚧 | `ncclSend` / `ncclRecv` (point-to-point) — in progress |
-| Expert parallelism / MoE | 🚧 | 🚧 | 🚧 | All-to-all via `ncclSend` / `ncclRecv` groups (in progress), and/or [DeepEP](https://github.com/deepseek-ai/DeepEP) |
+| Pipeline parallelism (PP) | ✅ | 🚧 | 🚧 | `ncclSend` / `ncclRecv`; DeepSpeed and TorchTitan also need data-carrying metadata exchange |
+| Expert parallelism / MoE | 🚧 | 🚧 | 🚧 | All-to-all via grouped `ncclSend` / `ncclRecv`, payload/routing semantics, and/or [DeepEP](https://github.com/deepseek-ai/DeepEP) |
 
-Two communication paths gate the 🚧 rows, and we are actively closing both:
+Two remaining limitations gate the 🚧 rows:
 
-- **NCCL point-to-point — in progress.** `ncclSend` / `ncclRecv` are being added to the stub. Pipeline parallelism uses them directly, and NCCL's all-to-all is implemented as grouped point-to-point, so MoE / expert parallelism unlocks at the same time.
+- **Payload-free NCCL simulation.** Phantora models the timing and ordering of point-to-point transfers, but it does not transfer bytes between ranks. The Megatron pipeline test derives activation tensor metadata locally from the model configuration, so it can run on top of timing-only P2P. DeepSpeed and TorchTitan pipeline paths exchange shape, dtype, or object metadata over distributed send/recv before the activation transfer; because those metadata bytes are not delivered under simulation, those PP paths are not supported yet.
 - **DeepEP — on the roadmap.** Some recent MoE training stacks (e.g., DeepSeek-style models) bypass NCCL entirely and use [DeepEP](https://github.com/deepseek-ai/DeepEP) for expert dispatch/combine. We plan to add a DeepEP interception layer so those stacks can be simulated as well.
 
 Rows marked `—` mean the feature does not exist in that framework. If you'd like to help land any of the in-progress pieces sooner, contributions are very welcome — see [Contributing](#contributing).
@@ -242,7 +242,7 @@ We especially welcome data points that fall outside what is covered above — di
 Contributions of any size are welcome:
 
 - **Ground-truth measurements** to expand the validation matrix — see the [Contributing ground truth](#contributing-ground-truth) checklist above.
-- **NCCL coverage** — see the matrix in [Limited NCCL coverage](#limited-nccl-coverage). PRs that add `ncclSend`/`ncclRecv` (which would unblock pipeline parallelism), `ncclReduce`, `ncclBroadcast`, or any other unimplemented entry point are especially valuable.
+- **NCCL coverage** — see the matrix in [Limited NCCL coverage](#limited-nccl-coverage). PRs that add payload-aware support for metadata exchanges, `ncclReduce`, `ncclBroadcast`, or any other unimplemented entry point are especially valuable.
 - **New ML frameworks or models** — Phantora's design is framework-agnostic; small runtime patches let new PyTorch-based frameworks run unchanged.
 - **Bug reports and feature requests** — please file them on [GitHub Issues](https://github.com/QDelta/Phantora/issues).
 

@@ -21,7 +21,11 @@ from megatron.core.distributed import (
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
 from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
-from megatron.core.pipeline_parallel.schedules import forward_backward_no_pipelining
+from megatron.core.pipeline_parallel.schedules import (
+    forward_backward_no_pipelining,
+    forward_backward_pipelining_with_interleaving,
+    forward_backward_pipelining_without_interleaving,
+)
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.module import Float16Module
@@ -83,6 +87,9 @@ class NullTokenizer(MegatronTokenizer):
 
 def get_model(
     tensor_parallel_size,
+    pipeline_model_parallel_size,
+    virtual_pipeline_model_parallel_size,
+    vp_stage,
     num_layers,
     hidden_size,
     ffn_hidden_size,
@@ -93,6 +100,8 @@ def get_model(
 ):
     transformer_config = TransformerConfig(
         tensor_model_parallel_size=tensor_parallel_size,
+        pipeline_model_parallel_size=pipeline_model_parallel_size,
+        virtual_pipeline_model_parallel_size=virtual_pipeline_model_parallel_size,
         num_layers=num_layers,
         hidden_size=hidden_size,
         ffn_hidden_size=ffn_hidden_size,
@@ -100,6 +109,7 @@ def get_model(
         perform_initialization=False,
         bf16=True,
         params_dtype=torch.bfloat16,
+        pipeline_dtype=torch.bfloat16,
         attention_backend=AttnBackend.flash,
         recompute_granularity="selective" if recompute_activations else None,
     )
@@ -111,6 +121,13 @@ def get_model(
             transformer_layer_spec=get_gpt_layer_local_spec(),
             vocab_size=vocab_size,
             max_sequence_length=sequence_length,
+            pre_process=parallel_state.is_pipeline_first_stage(
+                ignore_virtual=False, vp_stage=vp_stage
+            ),
+            post_process=parallel_state.is_pipeline_last_stage(
+                ignore_virtual=False, vp_stage=vp_stage
+            ),
+            vp_stage=vp_stage,
         ),
     )
 
@@ -137,9 +154,14 @@ def get_optimizer(model):
         clip_grad=0.0,  # no grad clipping because norm depends on communication and can cause error in simulation
     )
 
-    optim = get_megatron_optimizer(optim_config, [model], use_gloo_process_groups=False)
+    model_chunks = model if isinstance(model, list) else [model]
+    optim = get_megatron_optimizer(optim_config, model_chunks, use_gloo_process_groups=False)
 
     return optim
+
+
+def iter_model_chunks(model):
+    return model if isinstance(model, list) else [model]
 
 
 def get_train_data_iterator(vocab_size, micro_batch_size):
@@ -180,6 +202,8 @@ def forward_step_func(device, data_iterator, model):
 
 def main(
     tensor_parallel_size,
+    pipeline_model_parallel_size,
+    virtual_pipeline_model_parallel_size,
     num_layers,
     hidden_size,
     ffn_hidden_size,
@@ -201,43 +225,113 @@ def main(
         world_size=world_size, rank=rank, device_id=device
     )
     parallel_state.initialize_model_parallel(
-        tensor_model_parallel_size=tensor_parallel_size
+        tensor_model_parallel_size=tensor_parallel_size,
+        pipeline_model_parallel_size=pipeline_model_parallel_size,
+        virtual_pipeline_model_parallel_size=virtual_pipeline_model_parallel_size,
     )
 
     model_parallel_cuda_manual_seed(42)
 
-    model = get_model(
-        tensor_parallel_size,
-        num_layers,
-        hidden_size,
-        ffn_hidden_size,
-        num_attention_heads,
-        vocab_size,
-        4096,
-        recompute_activations
-    )
-    model = model.to(device)
-    model.train()
+    if virtual_pipeline_model_parallel_size is None:
+        model = get_model(
+            tensor_parallel_size,
+            pipeline_model_parallel_size,
+            None,
+            None,
+            num_layers,
+            hidden_size,
+            ffn_hidden_size,
+            num_attention_heads,
+            vocab_size,
+            4096,
+            recompute_activations
+        )
+        model = model.to(device)
+        model.train()
+    else:
+        model = []
+        for vp_stage in range(virtual_pipeline_model_parallel_size):
+            parallel_state.set_virtual_pipeline_model_parallel_rank(vp_stage)
+            model_chunk = get_model(
+                tensor_parallel_size,
+                pipeline_model_parallel_size,
+                virtual_pipeline_model_parallel_size,
+                vp_stage,
+                num_layers,
+                hidden_size,
+                ffn_hidden_size,
+                num_attention_heads,
+                vocab_size,
+                4096,
+                recompute_activations
+            )
+            model_chunk = model_chunk.to(device)
+            model_chunk.train()
+            model.append(model_chunk)
+        parallel_state.set_virtual_pipeline_model_parallel_rank(0)
+
+        no_sync_funcs = [model_chunk.no_sync for model_chunk in model]
+        for model_chunk in model:
+            model_chunk.config.no_sync_func = no_sync_funcs
+            model_chunk.config.finalize_model_grads_func = finalize_model_grads
+
     if rank == 0:
-        print(f"Model size: {sum(p.numel() for p in model.parameters())}")
+        model_size = sum(
+            p.numel()
+            for model_chunk in iter_model_chunks(model)
+            for p in model_chunk.parameters()
+        )
+        print(f"Model size: {model_size}")
     optim = get_optimizer(model)
-    train_iterator = get_train_data_iterator(vocab_size, micro_batch_size)
+
+    pp_size = pipeline_model_parallel_size
+    num_microbatches = max(gradient_accumulation, pp_size * 4) \
+        if pp_size > 1 else gradient_accumulation
 
     duras = []
     duras_wall = []
     for i in range(iterations):
+        if virtual_pipeline_model_parallel_size is None:
+            train_iterator = get_train_data_iterator(vocab_size, micro_batch_size)
+        else:
+            train_iterator = [
+                get_train_data_iterator(vocab_size, micro_batch_size)
+                for _ in range(virtual_pipeline_model_parallel_size)
+            ]
         start, start_wall = time_pair()
-        model.zero_grad_buffer()
+        for model_chunk in iter_model_chunks(model):
+            model_chunk.zero_grad_buffer()
         optim.zero_grad()
-        forward_backward_no_pipelining(
-            forward_step_func=functools.partial(forward_step_func, device),
-            data_iterator=train_iterator,
-            model=model,
-            num_microbatches=gradient_accumulation,
-            seq_length=4096,
-            micro_batch_size=micro_batch_size,
-            forward_only=False,
-        )
+        if pp_size > 1 and virtual_pipeline_model_parallel_size is not None:
+            forward_backward_pipelining_with_interleaving(
+                forward_step_func=functools.partial(forward_step_func, device),
+                data_iterator=train_iterator,
+                model=model,
+                num_microbatches=num_microbatches,
+                seq_length=4096,
+                micro_batch_size=micro_batch_size,
+                forward_only=False,
+            )
+        elif pp_size > 1:
+            forward_backward_pipelining_without_interleaving(
+                forward_step_func=functools.partial(forward_step_func, device),
+                data_iterator=train_iterator,
+                model=model,
+                num_microbatches=num_microbatches,
+                seq_length=4096,
+                micro_batch_size=micro_batch_size,
+                forward_only=False,
+            )
+        else:
+            forward_backward_no_pipelining(
+                forward_step_func=functools.partial(forward_step_func, device),
+                data_iterator=train_iterator,
+                model=model,
+                num_microbatches=num_microbatches,
+                seq_length=4096,
+                micro_batch_size=micro_batch_size,
+                forward_only=False,
+            )
         optim.step()
         torch.cuda.synchronize()
         end, end_wall = time_pair()
@@ -258,6 +352,8 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--tensor_parallel_size", type=int, default=4)
+    parser.add_argument("--pipeline_model_parallel_size", type=int, default=1)
+    parser.add_argument("--virtual_pipeline_model_parallel_size", type=int, default=None)
     parser.add_argument("--num_layers", type=int, default=32)
     parser.add_argument("--hidden_size", type=int, default=4096)
     parser.add_argument("--ffn_hidden_size", type=int, default=11008)
@@ -272,6 +368,8 @@ if __name__ == "__main__":
     enable_function_tracer()
     main(
         tensor_parallel_size=args.tensor_parallel_size,
+        pipeline_model_parallel_size=args.pipeline_model_parallel_size,
+        virtual_pipeline_model_parallel_size=args.virtual_pipeline_model_parallel_size,
         num_layers=args.num_layers,
         hidden_size=args.hidden_size,
         ffn_hidden_size=args.ffn_hidden_size,

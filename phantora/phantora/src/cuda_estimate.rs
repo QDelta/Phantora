@@ -33,7 +33,7 @@ macro_rules! estimate {
             };
             // CUPTI hygiene: drain pending warmup records before the
             // measured window opens. Sync first to make sure the
-            // warmup kernels have actually completed (they're async,
+            // warmup GPU work has actually completed (it's async,
             // so their CUPTI records may not exist yet without sync).
             if $crate::cupti::enabled() {
                 assert_cuda!(cudaDeviceSynchronize());

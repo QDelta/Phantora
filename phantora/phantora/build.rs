@@ -16,7 +16,10 @@ fn main() {
             format!("{}/targets/x86_64-linux/include", cuda_home),
             format!("{}/targets/x86_64-linux/lib", cuda_home),
         ),
-        (format!("{}/include", cuda_home), format!("{}/lib64", cuda_home)),
+        (
+            format!("{}/include", cuda_home),
+            format!("{}/lib64", cuda_home),
+        ),
     ] {
         let inc_path = PathBuf::from(&inc);
         let lib_path = PathBuf::from(&lib);

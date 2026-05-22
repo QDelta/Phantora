@@ -523,13 +523,13 @@ impl EventQueue {
                     match self.started.get_mut(&id) {
                         Some(started_record) => {
                             if started_record.start_time < new_start_time {
+                                let delta = new_start_time - started_record.start_time;
                                 started_record.start_time = new_start_time;
-                                let found = self.event_queue.change_priority_by(
-                                    &Event::End(id),
-                                    |Reverse((time, _))| {
-                                        *time += new_start_time - started_record.start_time
-                                    },
-                                );
+                                let found = self
+                                    .event_queue
+                                    .change_priority_by(&Event::End(id), |Reverse((time, _))| {
+                                        *time += delta
+                                    });
                                 assert!(found, "id: {}", id);
                             }
                         }

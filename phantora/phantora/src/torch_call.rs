@@ -537,6 +537,104 @@ impl TorchCallMsg {
                     None
                 }
             },
+            "aten::masked_fill" => match self.args.as_slice() {
+                [Tensor(shape, kind, _), Tensor(mask_shape, mask_kind, _), ..] => {
+                    Some(TorchCallInfo::MaskedFill(
+                        TensorInfo {
+                            shape: shape.clone(),
+                            dtype: *kind,
+                        },
+                        TensorInfo {
+                            shape: mask_shape.clone(),
+                            dtype: *mask_kind,
+                        },
+                    ))
+                }
+                _ => {
+                    log::warn!("{} args not match: {:?}", self.name, self.args);
+                    None
+                }
+            },
+            "aten::masked_fill_" => match self.args.as_slice() {
+                [Tensor(shape, kind, _), Tensor(mask_shape, mask_kind, _), ..] => {
+                    Some(TorchCallInfo::MaskedFill_(
+                        TensorInfo {
+                            shape: shape.clone(),
+                            dtype: *kind,
+                        },
+                        TensorInfo {
+                            shape: mask_shape.clone(),
+                            dtype: *mask_kind,
+                        },
+                    ))
+                }
+                _ => {
+                    log::warn!("{} args not match: {:?}", self.name, self.args);
+                    None
+                }
+            },
+            "aten::dropout" => match self.args.as_slice() {
+                [Tensor(shape, kind, _), Double(p), Bool(train)] => Some(TorchCallInfo::Dropout(
+                    TensorInfo {
+                        shape: shape.clone(),
+                        dtype: *kind,
+                    },
+                    (*p * 1_000_000.0).round() as i64,
+                    *train,
+                )),
+                _ => {
+                    log::warn!("{} args not match: {:?}", self.name, self.args);
+                    None
+                }
+            },
+            "aten::native_dropout" => match self.args.as_slice() {
+                [Tensor(shape, kind, _), Double(p), Bool(train)] => {
+                    Some(TorchCallInfo::NativeDropout(
+                        TensorInfo {
+                            shape: shape.clone(),
+                            dtype: *kind,
+                        },
+                        (*p * 1_000_000.0).round() as i64,
+                        *train,
+                    ))
+                }
+                _ => {
+                    log::warn!("{} args not match: {:?}", self.name, self.args);
+                    None
+                }
+            },
+            "aten::native_dropout_backward" => match self.args.as_slice() {
+                [Tensor(grad_shape, grad_kind, _), Tensor(mask_shape, mask_kind, _), Double(scale)] => {
+                    Some(TorchCallInfo::NativeDropoutBackward(
+                        TensorInfo {
+                            shape: grad_shape.clone(),
+                            dtype: *grad_kind,
+                        },
+                        TensorInfo {
+                            shape: mask_shape.clone(),
+                            dtype: *mask_kind,
+                        },
+                        (*scale * 1_000_000.0).round() as i64,
+                    ))
+                }
+                _ => {
+                    log::warn!("{} args not match: {:?}", self.name, self.args);
+                    None
+                }
+            },
+            "aten::_fused_dropout" => match self.args.as_slice() {
+                [Tensor(shape, kind, _), Double(p)] => Some(TorchCallInfo::FusedDropout(
+                    TensorInfo {
+                        shape: shape.clone(),
+                        dtype: *kind,
+                    },
+                    (*p * 1_000_000.0).round() as i64,
+                )),
+                _ => {
+                    log::warn!("{} args not match: {:?}", self.name, self.args);
+                    None
+                }
+            },
             "aten::where" => match self.args.as_slice() {
                 [Tensor(shape1, kind1, _), Tensor(shape2, kind2, _), Tensor(shape3, kind3, _)] => {
                     Some(TorchCallInfo::Where(
@@ -573,6 +671,44 @@ impl TorchCallMsg {
             },
             "aten::sqrt" => match self.args.as_slice() {
                 [Tensor(shape, kind, _)] => Some(TorchCallInfo::Sqrt(TensorInfo {
+                    shape: shape.clone(),
+                    dtype: *kind,
+                })),
+                _ => {
+                    log::warn!("{} args not match: {:?}", self.name, self.args);
+                    None
+                }
+            },
+            "aten::gelu" => match self.args.as_slice() {
+                [Tensor(shape, kind, _), ..] => Some(TorchCallInfo::Gelu(TensorInfo {
+                    shape: shape.clone(),
+                    dtype: *kind,
+                })),
+                _ => {
+                    log::warn!("{} args not match: {:?}", self.name, self.args);
+                    None
+                }
+            },
+            "aten::gelu_backward" => match self.args.as_slice() {
+                [Tensor(grad_shape, grad_kind, _), Tensor(self_shape, self_kind, _), ..] => {
+                    Some(TorchCallInfo::GeluBackward(
+                        TensorInfo {
+                            shape: grad_shape.clone(),
+                            dtype: *grad_kind,
+                        },
+                        TensorInfo {
+                            shape: self_shape.clone(),
+                            dtype: *self_kind,
+                        },
+                    ))
+                }
+                _ => {
+                    log::warn!("{} args not match: {:?}", self.name, self.args);
+                    None
+                }
+            },
+            "aten::sum" => match self.args.as_slice() {
+                [Tensor(shape, kind, _), ..] => Some(TorchCallInfo::Sum(TensorInfo {
                     shape: shape.clone(),
                     dtype: *kind,
                 })),
@@ -835,8 +971,17 @@ pub enum TorchCallInfo {
     AddCDiv_(TensorInfo, TensorInfo, TensorInfo),
     ForeachAddCMul_(Vec<TensorInfo>, Vec<TensorInfo>, Vec<TensorInfo>),
     ForeachAddCDiv_(Vec<TensorInfo>, Vec<TensorInfo>, Vec<TensorInfo>),
+    MaskedFill(TensorInfo, TensorInfo),
+    MaskedFill_(TensorInfo, TensorInfo),
+    Dropout(TensorInfo, i64, bool),
+    NativeDropout(TensorInfo, i64, bool),
+    NativeDropoutBackward(TensorInfo, TensorInfo, i64),
+    FusedDropout(TensorInfo, i64),
     Where(TensorInfo, TensorInfo, TensorInfo),
     WhereScalar(TensorInfo, TensorInfo),
+    Gelu(TensorInfo),
+    GeluBackward(TensorInfo, TensorInfo),
+    Sum(TensorInfo),
     Sqrt(TensorInfo),
     Softmax(TensorInfo, i64),
     SoftmaxBackward(TensorInfo, TensorInfo, i64),

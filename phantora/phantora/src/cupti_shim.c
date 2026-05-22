@@ -19,13 +19,27 @@
 // counter is single-writer for that window once the flush returns.
 
 #include <cupti.h>
+#include <cupti_version.h>
 #include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-static _Atomic uint64_t g_kernel_ns = 0;
+static _Atomic uint64_t g_activity_ns = 0;
+
+#if CUPTI_API_VERSION >= 130000
+#define PHANTORA_CUPTI_MEMCPY_RECORD CUpti_ActivityMemcpy6
+#else
+#define PHANTORA_CUPTI_MEMCPY_RECORD CUpti_ActivityMemcpy5
+#endif
+
+static void add_activity_duration(uint64_t start, uint64_t end)
+{
+    if (start == 0 && end == 0) return;
+    if (end < start) return;
+    atomic_fetch_add_explicit(&g_activity_ns, end - start, memory_order_relaxed);
+}
 
 static void CUPTIAPI buf_requested(uint8_t **buffer, size_t *size,
                                    size_t *max_records)
@@ -53,9 +67,16 @@ static void CUPTIAPI buf_completed(CUcontext ctx, uint32_t stream_id,
             // upgraded to a CUDA toolkit with newer kernel records,
             // bump this cast.
             CUpti_ActivityKernel8 *k = (CUpti_ActivityKernel8 *)r;
-            atomic_fetch_add_explicit(&g_kernel_ns,
-                                      k->end - k->start,
-                                      memory_order_relaxed);
+            add_activity_duration(k->start, k->end);
+        } else if (r->kind == CUPTI_ACTIVITY_KIND_MEMCPY) {
+            PHANTORA_CUPTI_MEMCPY_RECORD *m = (PHANTORA_CUPTI_MEMCPY_RECORD *)r;
+            add_activity_duration(m->start, m->end);
+        } else if (r->kind == CUPTI_ACTIVITY_KIND_MEMCPY2) {
+            CUpti_ActivityMemcpyPtoP4 *m = (CUpti_ActivityMemcpyPtoP4 *)r;
+            add_activity_duration(m->start, m->end);
+        } else if (r->kind == CUPTI_ACTIVITY_KIND_MEMSET) {
+            CUpti_ActivityMemset4 *m = (CUpti_ActivityMemset4 *)r;
+            add_activity_duration(m->start, m->end);
         }
     }
     free(buffer);
@@ -69,13 +90,19 @@ int phantora_cupti_init(void)
     if (r1 != CUPTI_SUCCESS) return (int)r1;
     CUptiResult r2 = cuptiActivityEnable(CUPTI_ACTIVITY_KIND_CONCURRENT_KERNEL);
     if (r2 != CUPTI_SUCCESS) return (int)r2;
+    CUptiResult r3 = cuptiActivityEnable(CUPTI_ACTIVITY_KIND_MEMCPY);
+    if (r3 != CUPTI_SUCCESS) return (int)r3;
+    CUptiResult r4 = cuptiActivityEnable(CUPTI_ACTIVITY_KIND_MEMCPY2);
+    if (r4 != CUPTI_SUCCESS) return (int)r4;
+    CUptiResult r5 = cuptiActivityEnable(CUPTI_ACTIVITY_KIND_MEMSET);
+    if (r5 != CUPTI_SUCCESS) return (int)r5;
     initialised = 1;
     return 0;
 }
 
 void phantora_cupti_clear(void)
 {
-    atomic_store_explicit(&g_kernel_ns, 0, memory_order_release);
+    atomic_store_explicit(&g_activity_ns, 0, memory_order_release);
 }
 
 void phantora_cupti_flush(void)
@@ -83,7 +110,7 @@ void phantora_cupti_flush(void)
     cuptiActivityFlushAll(0);
 }
 
-uint64_t phantora_cupti_sum_kernel_ns(void)
+uint64_t phantora_cupti_sum_activity_ns(void)
 {
-    return atomic_load_explicit(&g_kernel_ns, memory_order_acquire);
+    return atomic_load_explicit(&g_activity_ns, memory_order_acquire);
 }
