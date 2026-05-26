@@ -14,11 +14,11 @@
 #endif
 
 #define NCCL_MAJOR 2
-#define NCCL_MINOR 18
-#define NCCL_PATCH 5
+#define NCCL_MINOR 24
+#define NCCL_PATCH 3
 #define NCCL_SUFFIX ""
 
-#define NCCL_VERSION_CODE 21805
+#define NCCL_VERSION_CODE 22403
 #define NCCL_VERSION(X,Y,Z) (((X) <= 2 && (Y) <= 8) ? (X) * 1000 + (Y) * 100 + (Z) : (X) * 10000 + (Y) * 100 + (Z))
 
 #ifdef __cplusplus
