@@ -381,7 +381,14 @@ cudaDeviceGetPCIBusId(char* pciBusId, int len, int device)
 cudaError_t
 cudaDriverGetVersion(int* driverVersion)
 {
-    *driverVersion = 11080;
+    *driverVersion = 12080;
+    return cudaSuccess;
+}
+
+cudaError_t
+cudaRuntimeGetVersion(int* runtimeVersion)
+{
+    *runtimeVersion = 12080;
     return cudaSuccess;
 }
 
@@ -557,10 +564,13 @@ _dummy() // accept any number of arguments
 cudaError_t
 cudaGetDriverEntryPoint(const char* symbol,
                         void** funcPtr,
-                        unsigned long long flags)
+                        unsigned long long flags,
+                        enum cudaDriverEntryPointQueryResult* driverStatus)
 {
     // TODO
     *funcPtr = _dummy;
+    if (driverStatus)
+        *driverStatus = cudaDriverEntryPointSuccess;
     return cudaSuccess;
 }
 

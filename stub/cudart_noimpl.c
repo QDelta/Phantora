@@ -231,14 +231,9 @@ cudaStreamEndCapture(cudaStream_t stream, cudaGraph_t* pGraph)
     NOT_IMPLEMENTED;
 }
 
-cudaError_t
-cudaStreamGetCaptureInfo(cudaStream_t stream,
-                         enum cudaStreamCaptureStatus* pCaptureStatus,
-                         unsigned long long* pId)
-{
-    NOT_IMPLEMENTED;
-}
-
+// CUDA 12.8: cudaStreamGetCaptureInfo is now #define'd to
+// cudaStreamGetCaptureInfo_v2 (the 6-arg form below), so the old 3-arg
+// definition is dropped to avoid a conflicting/duplicate symbol.
 cudaError_t
 cudaStreamGetCaptureInfo_v2(cudaStream_t stream,
                             enum cudaStreamCaptureStatus* captureStatus_out,
@@ -1179,12 +1174,6 @@ cudaGetSurfaceObjectResourceDesc(struct cudaResourceDesc* pResDesc,
 }
 
 cudaError_t
-cudaRuntimeGetVersion(int* runtimeVersion)
-{
-    NOT_IMPLEMENTED;
-}
-
-cudaError_t
 cudaGraphCreate(cudaGraph_t* pGraph, unsigned int flags)
 {
     NOT_IMPLEMENTED;
@@ -1689,9 +1678,7 @@ cudaGraphDestroyNode(cudaGraphNode_t node)
 cudaError_t
 cudaGraphInstantiate(cudaGraphExec_t* pGraphExec,
                      cudaGraph_t graph,
-                     cudaGraphNode_t* pErrorNode,
-                     char* pLogBuffer,
-                     size_t bufferSize)
+                     unsigned long long flags)
 {
     NOT_IMPLEMENTED;
 }
@@ -1854,8 +1841,7 @@ cudaGraphNodeGetEnabled(cudaGraphExec_t hGraphExec,
 cudaError_t
 cudaGraphExecUpdate(cudaGraphExec_t hGraphExec,
                     cudaGraph_t hGraph,
-                    cudaGraphNode_t* hErrorNode_out,
-                    enum cudaGraphExecUpdateResult* updateResult_out)
+                    cudaGraphExecUpdateResultInfo* resultInfo)
 {
     NOT_IMPLEMENTED;
 }
