@@ -261,14 +261,6 @@ cudaEventCreate(cudaEvent_t* event)
 }
 
 cudaError_t
-cudaEventRecordWithFlags(cudaEvent_t event,
-                         cudaStream_t stream,
-                         unsigned int flags)
-{
-    NOT_IMPLEMENTED;
-}
-
-cudaError_t
 cudaImportExternalMemory(
   cudaExternalMemory_t* extMem_out,
   const struct cudaExternalMemoryHandleDesc* memHandleDesc)

@@ -446,6 +446,19 @@ cudaEventRecord(cudaEvent_t event, cudaStream_t stream)
 }
 
 cudaError_t
+cudaEventRecordWithFlags(cudaEvent_t event, cudaStream_t stream, unsigned int flags)
+{
+    // flags (e.g. cudaEventRecordExternal) are scheduling hints; ignore for
+    // simulation and record like cudaEventRecord.
+    (void)flags;
+    struct phantora_cudaEvent* event_ = (struct phantora_cudaEvent*)event;
+    struct phantora_cudaStream stream_ = phantora_cudaStream(stream);
+    event_->stream = stream_.id;
+    cuda_event_record(event_->device, event_->stream, event_->id);
+    return cudaSuccess;
+}
+
+cudaError_t
 cudaStreamWaitEvent(cudaStream_t stream, cudaEvent_t event, unsigned int flags)
 {
     struct phantora_cudaEvent* event_ = (struct phantora_cudaEvent*)event;
