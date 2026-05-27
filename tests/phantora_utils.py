@@ -46,6 +46,23 @@ else:
     except ImportError:
         pass
 
+    # DTensor's OffsetBasedRNGTracker syncs rank 0's RNG state by broadcasting a
+    # CUDA tensor over NCCL. Under Phantora, NCCL collectives are simulated and
+    # move no real data, so the synced philox offset is garbage and the generator
+    # rejects it ("offset must be a multiple of 4"), breaking FSDP2 (e.g.
+    # TorchTitan) weight init. Disable the sync: it's unnecessary here (one
+    # physical GPU) and RNG values are arbitrary under simulation anyway.
+    try:
+        from torch.distributed.tensor import _random as _dtensor_random
+        _orig_rng_tracker_init = _dtensor_random.OffsetBasedRNGTracker.__init__
+
+        def _no_sync_rng_tracker_init(self, device_mesh, run_state_sync=True, *args, **kwargs):
+            _orig_rng_tracker_init(self, device_mesh, False, *args, **kwargs)
+
+        _dtensor_random.OffsetBasedRNGTracker.__init__ = _no_sync_rng_tracker_init
+    except (ImportError, AttributeError):
+        pass
+
 def enable_function_tracer() -> None:
     if os.environ.get('PHANTORA') is not None:
         prefix = os.environ['PHANTORA_SOCKET_PREFIX']
