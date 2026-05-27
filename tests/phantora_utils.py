@@ -46,20 +46,28 @@ else:
     except ImportError:
         pass
 
-    # DTensor's OffsetBasedRNGTracker syncs rank 0's RNG state by broadcasting a
-    # CUDA tensor over NCCL. Under Phantora, NCCL collectives are simulated and
-    # move no real data, so the synced philox offset is garbage and the generator
-    # rejects it ("offset must be a multiple of 4"), breaking FSDP2 (e.g.
-    # TorchTitan) weight init. Disable the sync: it's unnecessary here (one
-    # physical GPU) and RNG values are arbitrary under simulation anyway.
+    # DTensor's OffsetBasedRNGTracker keeps the RNG state on the GPU
+    # (`get_rng_state().to(device)`) and reads the philox offset back out of it.
+    # Under Phantora, values round-tripped through GPU memory are arbitrary, so
+    # the offset comes back non-multiple-of-4 and `set_rng_state` rejects it
+    # ("offset must be a multiple of 4"), breaking FSDP2 (e.g. TorchTitan) weight
+    # init. Keep the state on CPU so the real offset is read, and skip the
+    # rank-0 state broadcast (a NCCL collective that moves no real data here).
     try:
         from torch.distributed.tensor import _random as _dtensor_random
+
         _orig_rng_tracker_init = _dtensor_random.OffsetBasedRNGTracker.__init__
 
         def _no_sync_rng_tracker_init(self, device_mesh, run_state_sync=True, *args, **kwargs):
             _orig_rng_tracker_init(self, device_mesh, False, *args, **kwargs)
 
+        def _cpu_device_state(self):
+            # Original returns `get_rng_state().to(self._device)`; drop the .to()
+            # so the offset stays a real, CPU-side value under simulation.
+            return self._device_handle.get_rng_state()
+
         _dtensor_random.OffsetBasedRNGTracker.__init__ = _no_sync_rng_tracker_init
+        _dtensor_random.OffsetBasedRNGTracker._get_device_state = _cpu_device_state
     except (ImportError, AttributeError):
         pass
 
