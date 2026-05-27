@@ -1,8 +1,8 @@
 // Small C wrapper around CUPTI's Activity API.
 //
 // Why this isn't pure-Rust FFI: the CUpti_ActivityKernel record layout
-// has gone through 8 versions (CUpti_ActivityKernel ... Kernel8 in the
-// CUDA 11.8 headers, more in newer CUDA), each adding fields. Writing
+// has gone through 9+ versions (CUpti_ActivityKernel ... Kernel9 in the
+// CUDA 12.x headers, more in newer CUDA), each adding fields. Writing
 // version-correct #[repr(C)] structs in Rust would couple us to a
 // specific CUDA version. Casting to the right struct in C and exposing
 // only the fields we need (start, end timestamps in ns) keeps the
@@ -60,13 +60,13 @@ static void CUPTIAPI buf_completed(CUcontext ctx, uint32_t stream_id,
     while (cuptiActivityGetNextRecord(buffer, valid_size, &r) == CUPTI_SUCCESS) {
         if (r->kind == CUPTI_ACTIVITY_KIND_CONCURRENT_KERNEL ||
             r->kind == CUPTI_ACTIVITY_KIND_KERNEL) {
-            // CUDA 11.8 ships CUpti_ActivityKernel8 as the latest. The
+            // CUDA 12.x ships CUpti_ActivityKernel9 as the latest. The
             // start/end fields are stable across versions, but the
             // surrounding fields differ — cast to the latest available
             // type so we read the right offsets. If the image is later
             // upgraded to a CUDA toolkit with newer kernel records,
             // bump this cast.
-            CUpti_ActivityKernel8 *k = (CUpti_ActivityKernel8 *)r;
+            CUpti_ActivityKernel9 *k = (CUpti_ActivityKernel9 *)r;
             add_activity_duration(k->start, k->end);
         } else if (r->kind == CUPTI_ACTIVITY_KIND_MEMCPY) {
             PHANTORA_CUPTI_MEMCPY_RECORD *m = (PHANTORA_CUPTI_MEMCPY_RECORD *)r;

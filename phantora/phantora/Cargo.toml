@@ -9,7 +9,7 @@ netsim = { path = "../netsim" }
 bincode = "1.3.3"
 ordered-float = "3.9.2"
 priority-queue = "1.4.0"
-tch = { git = "https://github.com/QDelta/tch-rs", branch = "fix-0.20.0" }
+tch = { git = "https://github.com/QDelta/tch-rs", rev = "f7fb153bd46c0df5f1107f3748b5595d6c39a1dc" }
 serde_json = "1.0.113"
 serde = { version = "1.0.196", features = ["derive"] }
 serde-big-array = "0.5.1"

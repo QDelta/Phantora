@@ -89,7 +89,7 @@ Rows marked `—` mean the feature does not exist in that framework. If you'd li
 
 - Linux x86_64
 - An NVIDIA GPU for kernel profiling. The build targets compute capability 8.0 (e.g., A100, H200) and 9.0 (e.g., H100); other GPUs may work but are untested.
-- CUDA 11.8 (the Docker image is based on `nvidia/cuda:11.8.0-devel-ubuntu22.04`)
+- CUDA 12.8 (the Docker image is based on `nvidia/cuda:12.8.0-devel-ubuntu22.04`)
 - Docker with Docker Compose (recommended)
 - Python 3.11.9 if building outside Docker
 - Tens of GB of free disk for the image and downloaded model assets
@@ -104,7 +104,7 @@ cd Phantora
 git submodule update --init --recursive
 ```
 
-Note: `pytorch/` is a git submodule pointing at a custom PyTorch branch (`2.7.1-phantora`) with the function tracer patched.
+Note: `pytorch/` is a git submodule pointing at a custom PyTorch branch (`2.9.1-phantora`) with the function tracer patched.
 
 Docker (with Docker Compose) is recommended for building and using Phantora. In the repository root, run:
 

@@ -46,6 +46,31 @@ else:
     except ImportError:
         pass
 
+    # DTensor's OffsetBasedRNGTracker keeps the RNG state on the GPU
+    # (`get_rng_state().to(device)`) and reads the philox offset back out of it.
+    # Under Phantora, values round-tripped through GPU memory are arbitrary, so
+    # the offset comes back non-multiple-of-4 and `set_rng_state` rejects it
+    # ("offset must be a multiple of 4"), breaking FSDP2 (e.g. TorchTitan) weight
+    # init. Keep the state on CPU so the real offset is read, and skip the
+    # rank-0 state broadcast (a NCCL collective that moves no real data here).
+    try:
+        from torch.distributed.tensor import _random as _dtensor_random
+
+        _orig_rng_tracker_init = _dtensor_random.OffsetBasedRNGTracker.__init__
+
+        def _no_sync_rng_tracker_init(self, device_mesh, run_state_sync=True, *args, **kwargs):
+            _orig_rng_tracker_init(self, device_mesh, False, *args, **kwargs)
+
+        def _cpu_device_state(self):
+            # Original returns `get_rng_state().to(self._device)`; drop the .to()
+            # so the offset stays a real, CPU-side value under simulation.
+            return self._device_handle.get_rng_state()
+
+        _dtensor_random.OffsetBasedRNGTracker.__init__ = _no_sync_rng_tracker_init
+        _dtensor_random.OffsetBasedRNGTracker._get_device_state = _cpu_device_state
+    except (ImportError, AttributeError):
+        pass
+
 def enable_function_tracer() -> None:
     if os.environ.get('PHANTORA') is not None:
         prefix = os.environ['PHANTORA_SOCKET_PREFIX']

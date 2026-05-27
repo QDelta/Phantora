@@ -381,7 +381,14 @@ cudaDeviceGetPCIBusId(char* pciBusId, int len, int device)
 cudaError_t
 cudaDriverGetVersion(int* driverVersion)
 {
-    *driverVersion = 11080;
+    *driverVersion = 12080;
+    return cudaSuccess;
+}
+
+cudaError_t
+cudaRuntimeGetVersion(int* runtimeVersion)
+{
+    *runtimeVersion = 12080;
     return cudaSuccess;
 }
 
@@ -431,6 +438,19 @@ cudaStreamDestroy(cudaStream_t stream)
 cudaError_t
 cudaEventRecord(cudaEvent_t event, cudaStream_t stream)
 {
+    struct phantora_cudaEvent* event_ = (struct phantora_cudaEvent*)event;
+    struct phantora_cudaStream stream_ = phantora_cudaStream(stream);
+    event_->stream = stream_.id;
+    cuda_event_record(event_->device, event_->stream, event_->id);
+    return cudaSuccess;
+}
+
+cudaError_t
+cudaEventRecordWithFlags(cudaEvent_t event, cudaStream_t stream, unsigned int flags)
+{
+    // flags (e.g. cudaEventRecordExternal) are scheduling hints; ignore for
+    // simulation and record like cudaEventRecord.
+    (void)flags;
     struct phantora_cudaEvent* event_ = (struct phantora_cudaEvent*)event;
     struct phantora_cudaStream stream_ = phantora_cudaStream(stream);
     event_->stream = stream_.id;
@@ -557,10 +577,13 @@ _dummy() // accept any number of arguments
 cudaError_t
 cudaGetDriverEntryPoint(const char* symbol,
                         void** funcPtr,
-                        unsigned long long flags)
+                        unsigned long long flags,
+                        enum cudaDriverEntryPointQueryResult* driverStatus)
 {
     // TODO
     *funcPtr = _dummy;
+    if (driverStatus)
+        *driverStatus = cudaDriverEntryPointSuccess;
     return cudaSuccess;
 }
 
