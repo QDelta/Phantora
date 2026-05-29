@@ -94,9 +94,15 @@ def get_model(
     hidden_size,
     ffn_hidden_size,
     num_attention_heads,
+    num_query_groups,
     vocab_size,
     sequence_length,
     recompute_activations,
+    swiglu,
+    position_embedding_type,
+    rotary_base,
+    normalization,
+    disable_bias_linear,
 ):
     transformer_config = TransformerConfig(
         tensor_model_parallel_size=tensor_parallel_size,
@@ -106,6 +112,11 @@ def get_model(
         hidden_size=hidden_size,
         ffn_hidden_size=ffn_hidden_size,
         num_attention_heads=num_attention_heads,
+        num_query_groups=num_query_groups,
+        gated_linear_unit=swiglu,
+        activation_func=torch.nn.functional.silu if swiglu else torch.nn.functional.gelu,
+        normalization=normalization,
+        add_bias_linear=not disable_bias_linear,
         perform_initialization=False,
         bf16=True,
         params_dtype=torch.bfloat16,
@@ -121,6 +132,8 @@ def get_model(
             transformer_layer_spec=get_gpt_layer_local_spec(),
             vocab_size=vocab_size,
             max_sequence_length=sequence_length,
+            position_embedding_type=position_embedding_type,
+            rotary_base=rotary_base,
             pre_process=parallel_state.is_pipeline_first_stage(
                 ignore_virtual=False, vp_stage=vp_stage
             ),
@@ -207,12 +220,18 @@ def main(
     hidden_size,
     ffn_hidden_size,
     num_attention_heads,
+    num_query_groups,
     vocab_size,
     sequence_length,
     micro_batch_size,
     gradient_accumulation,
     recompute_activations,
     iterations,
+    swiglu,
+    position_embedding_type,
+    rotary_base,
+    normalization,
+    disable_bias_linear,
 ):
     world_size = int(os.environ["WORLD_SIZE"])
     rank = int(os.environ["RANK"])
@@ -243,9 +262,15 @@ def main(
             hidden_size,
             ffn_hidden_size,
             num_attention_heads,
+            num_query_groups,
             vocab_size,
             sequence_length,
             recompute_activations,
+            swiglu,
+            position_embedding_type,
+            rotary_base,
+            normalization,
+            disable_bias_linear,
         )
         model = model.to(device)
         model.train()
@@ -262,9 +287,15 @@ def main(
                 hidden_size,
                 ffn_hidden_size,
                 num_attention_heads,
+                num_query_groups,
                 vocab_size,
                 sequence_length,
-                recompute_activations
+                recompute_activations,
+                swiglu,
+                position_embedding_type,
+                rotary_base,
+                normalization,
+                disable_bias_linear,
             )
             model_chunk = model_chunk.to(device)
             model_chunk.train()
@@ -359,12 +390,24 @@ if __name__ == "__main__":
     parser.add_argument("--hidden_size", type=int, default=4096)
     parser.add_argument("--ffn_hidden_size", type=int, default=11008)
     parser.add_argument("--num_attention_heads", type=int, default=32)
+    parser.add_argument("--num_query_groups", type=int, default=None,
+        help="Number of KV heads for GQA (None = MHA, i.e., equal to num_attention_heads).")
     parser.add_argument("--vocab_size", type=int, default=32000)
     parser.add_argument("--sequence_length", type=int, default=4096)
     parser.add_argument("--micro_batch_size", type=int, default=1)
     parser.add_argument("--gradient_accumulation", type=int, default=1)
     parser.add_argument("--recompute_activations", action="store_true")
     parser.add_argument("--iterations", type=int, default=4)
+    # Architectural knobs (names mirror Megatron's TransformerConfig / GPTModel fields).
+    parser.add_argument("--swiglu", action="store_true",
+        help="Use SwiGLU gated MLP (Megatron's `gated_linear_unit=True`).")
+    parser.add_argument("--position_embedding_type", type=str, default="learned_absolute",
+        choices=["learned_absolute", "rope"])
+    parser.add_argument("--rotary_base", type=float, default=10000.0)
+    parser.add_argument("--normalization", type=str, default="LayerNorm",
+        choices=["LayerNorm", "RMSNorm"])
+    parser.add_argument("--disable_bias_linear", action="store_true",
+        help="Set `add_bias_linear=False` (Megatron default is True).")
     args = parser.parse_args()
 
     enable_function_tracer()
@@ -382,5 +425,11 @@ if __name__ == "__main__":
         gradient_accumulation=args.gradient_accumulation,
         recompute_activations=args.recompute_activations,
         iterations=args.iterations,
+        num_query_groups=args.num_query_groups,
+        swiglu=args.swiglu,
+        position_embedding_type=args.position_embedding_type,
+        rotary_base=args.rotary_base,
+        normalization=args.normalization,
+        disable_bias_linear=args.disable_bias_linear,
     )
     disable_function_tracer()
