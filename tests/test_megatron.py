@@ -164,17 +164,16 @@ def iter_model_chunks(model):
     return model if isinstance(model, list) else [model]
 
 
-def get_train_data_iterator(vocab_size, micro_batch_size):
+def get_train_data_iterator(vocab_size, micro_batch_size, sequence_length):
     config = GPTDatasetConfig(
         random_seed=42,
-        sequence_length=4096,
+        sequence_length=sequence_length,
         reset_position_ids=False,
         reset_attention_mask=False,
         eod_mask_loss=False,
         tokenizer=NullTokenizer(vocab_size-1),
     )
     config.mock = True
-    # seems MockGPTDataset hardcoded sequence length to 4096
     datasets = BlendedMegatronDatasetBuilder(
         MockGPTDataset, [None, None, None], lambda: True, config
     ).build()
@@ -209,6 +208,7 @@ def main(
     ffn_hidden_size,
     num_attention_heads,
     vocab_size,
+    sequence_length,
     micro_batch_size,
     gradient_accumulation,
     recompute_activations,
@@ -228,6 +228,7 @@ def main(
         tensor_model_parallel_size=tensor_parallel_size,
         pipeline_model_parallel_size=pipeline_model_parallel_size,
         virtual_pipeline_model_parallel_size=virtual_pipeline_model_parallel_size,
+        create_gloo_process_groups=False,
     )
 
     model_parallel_cuda_manual_seed(42)
@@ -243,8 +244,8 @@ def main(
             ffn_hidden_size,
             num_attention_heads,
             vocab_size,
-            4096,
-            recompute_activations
+            sequence_length,
+            recompute_activations,
         )
         model = model.to(device)
         model.train()
@@ -262,7 +263,7 @@ def main(
                 ffn_hidden_size,
                 num_attention_heads,
                 vocab_size,
-                4096,
+                sequence_length,
                 recompute_activations
             )
             model_chunk = model_chunk.to(device)
@@ -292,10 +293,10 @@ def main(
     duras_wall = []
     for i in range(iterations):
         if virtual_pipeline_model_parallel_size is None:
-            train_iterator = get_train_data_iterator(vocab_size, micro_batch_size)
+            train_iterator = get_train_data_iterator(vocab_size, micro_batch_size, sequence_length)
         else:
             train_iterator = [
-                get_train_data_iterator(vocab_size, micro_batch_size)
+                get_train_data_iterator(vocab_size, micro_batch_size, sequence_length)
                 for _ in range(virtual_pipeline_model_parallel_size)
             ]
         start, start_wall = time_pair()
@@ -308,7 +309,7 @@ def main(
                 data_iterator=train_iterator,
                 model=model,
                 num_microbatches=num_microbatches,
-                seq_length=4096,
+                seq_length=sequence_length,
                 micro_batch_size=micro_batch_size,
                 forward_only=False,
             )
@@ -318,7 +319,7 @@ def main(
                 data_iterator=train_iterator,
                 model=model,
                 num_microbatches=num_microbatches,
-                seq_length=4096,
+                seq_length=sequence_length,
                 micro_batch_size=micro_batch_size,
                 forward_only=False,
             )
@@ -328,7 +329,7 @@ def main(
                 data_iterator=train_iterator,
                 model=model,
                 num_microbatches=num_microbatches,
-                seq_length=4096,
+                seq_length=sequence_length,
                 micro_batch_size=micro_batch_size,
                 forward_only=False,
             )
@@ -359,6 +360,7 @@ if __name__ == "__main__":
     parser.add_argument("--ffn_hidden_size", type=int, default=11008)
     parser.add_argument("--num_attention_heads", type=int, default=32)
     parser.add_argument("--vocab_size", type=int, default=32000)
+    parser.add_argument("--sequence_length", type=int, default=4096)
     parser.add_argument("--micro_batch_size", type=int, default=1)
     parser.add_argument("--gradient_accumulation", type=int, default=1)
     parser.add_argument("--recompute_activations", action="store_true")
@@ -375,6 +377,7 @@ if __name__ == "__main__":
         ffn_hidden_size=args.ffn_hidden_size,
         num_attention_heads=args.num_attention_heads,
         vocab_size=args.vocab_size,
+        sequence_length=args.sequence_length,
         micro_batch_size=args.micro_batch_size,
         gradient_accumulation=args.gradient_accumulation,
         recompute_activations=args.recompute_activations,
