@@ -9,6 +9,24 @@ from torch.profiler import (
 import torch.nn.parameter
 from torch.utils.data import Dataset
 
+_PHANTORA_METADATA_PROCESS_GROUP_CACHE = {}
+
+
+def get_phantora_metadata_process_group(group=None):
+    """Return the cached Gloo process group for Phantora metadata messages."""
+    import torch.distributed as dist
+
+    if os.environ.get("PHANTORA") is None or not dist.is_initialized():
+        return group
+    if group is None:
+        ranks = tuple(range(dist.get_world_size()))
+    else:
+        ranks = tuple(dist.get_process_group_ranks(group))
+    if ranks not in _PHANTORA_METADATA_PROCESS_GROUP_CACHE:
+        _PHANTORA_METADATA_PROCESS_GROUP_CACHE[ranks] = dist.new_group(list(ranks), backend="gloo")
+    return _PHANTORA_METADATA_PROCESS_GROUP_CACHE[ranks]
+
+
 if os.environ.get('PHANTORA') is None:
     def time() -> float:
         return _time.perf_counter()
@@ -70,6 +88,217 @@ else:
         _dtensor_random.OffsetBasedRNGTracker._get_device_state = _cpu_device_state
     except (ImportError, AttributeError):
         pass
+
+
+def install_phantora_deepspeed_patches() -> None:
+    """Patch DeepSpeed PP tensor metadata exchange.
+
+    Used by tests/test_deepspeed.py after deepspeed.init_distributed().
+
+    Patch targets:
+      - deepspeed.runtime.pipe.engine.PipelineEngine._send_tensor_meta
+      - deepspeed.runtime.pipe.engine.PipelineEngine._recv_tensor_meta
+
+    Original: allocate an int32 metadata tensor on self.device and send/recv it
+    with deepspeed.runtime.pipe.p2p.
+    Replacement: encode the same metadata layout on CPU and send/recv it through
+    get_phantora_metadata_process_group().
+    """
+    if os.environ.get("PHANTORA") is None:
+        return
+    try:
+        import torch.distributed as dist
+        import deepspeed.runtime.bf16_optimizer as ds_bf16
+        import deepspeed.runtime.pipe.engine as ds_engine
+    except (ImportError, AttributeError):
+        return
+
+    get_phantora_metadata_process_group()
+
+    def _positive_norm(norm):
+        if torch.is_tensor(norm):
+            return torch.where(norm > 0, norm, torch.ones_like(norm))
+        return norm if norm > 0 else 1.0
+
+    if not getattr(ds_bf16.get_global_norm_of_tensors, "_phantora_positive_norm", False):
+        # Patch target: deepspeed.runtime.bf16_optimizer.get_global_norm_of_tensors.
+        # Original: may return zero when Phantora does not preserve gradient values.
+        # Replacement: keep the original norm unless it is non-positive.
+        _orig_get_global_norm_of_tensors = ds_bf16.get_global_norm_of_tensors
+
+        def get_global_norm_of_tensors(*args, **kwargs):
+            return _positive_norm(_orig_get_global_norm_of_tensors(*args, **kwargs))
+
+        get_global_norm_of_tensors._phantora_positive_norm = True
+        ds_bf16.get_global_norm_of_tensors = get_global_norm_of_tensors
+
+    if not getattr(ds_bf16.get_norm_with_moe_layers, "_phantora_positive_norm", False):
+        # Patch target: deepspeed.runtime.bf16_optimizer.get_norm_with_moe_layers.
+        # Original: may return zero after combining MoE/non-MoE norms.
+        # Replacement: keep the original norm unless it is non-positive.
+        _orig_get_norm_with_moe_layers = ds_bf16.get_norm_with_moe_layers
+
+        def get_norm_with_moe_layers(*args, **kwargs):
+            return _positive_norm(_orig_get_norm_with_moe_layers(*args, **kwargs))
+
+        get_norm_with_moe_layers._phantora_positive_norm = True
+        ds_bf16.get_norm_with_moe_layers = get_norm_with_moe_layers
+
+    PipelineEngine = ds_engine.PipelineEngine
+    if getattr(PipelineEngine, "_phantora_cpu_meta", False):
+        return
+
+    # Helper mirrors DeepSpeed's original metadata layout:
+    # [kind, dtype_id, ndims, *shape] for tensors and
+    # [kind=2, num_tensors, dtype_id, ndims, *shape, ...] for tuples.
+    def _meta_list(self, buffer):
+        if isinstance(buffer, torch.Tensor):
+            return [0, self.DTYPE_TO_ID[buffer.dtype], len(buffer.size()), *buffer.size()]
+        if isinstance(buffer, tuple):
+            meta = [2, len(buffer)]
+            for tensor in buffer:
+                meta.extend([self.DTYPE_TO_ID[tensor.dtype], len(tensor.size()), *tensor.size()])
+            return meta
+        raise NotImplementedError(f"Could not send meta type {type(buffer)}")
+
+    def _send_tensor_meta(self, buffer, recv_stage):
+        meta = _meta_list(self, buffer)
+        assert len(meta) <= ds_engine.TENSOR_META_SIZE
+        meta_buffer = torch.zeros(ds_engine.TENSOR_META_SIZE, dtype=torch.int32)
+        meta_buffer[:len(meta)] = torch.tensor(meta, dtype=torch.int32)
+        dist.send(
+            meta_buffer,
+            dst=self.grid.stage_to_global(stage_id=recv_stage),
+            group=get_phantora_metadata_process_group(),
+        )
+
+    def _recv_tensor_meta(self, send_stage):
+        meta_buffer = torch.empty(ds_engine.TENSOR_META_SIZE, dtype=torch.int32)
+        dist.recv(
+            meta_buffer,
+            src=self.grid.stage_to_global(stage_id=send_stage),
+            group=get_phantora_metadata_process_group(),
+        )
+        recv_type = meta_buffer[0].item()
+        if recv_type == 0:
+            dtype = self.ID_TO_DTYPE[meta_buffer[1].item()]
+            ndims = meta_buffer[2].item()
+            shape = meta_buffer[3:3 + ndims].tolist()
+            return self._allocate_or_extend_buffers(0, shape, dtype)
+        if recv_type in (1, 2):
+            buffers, offset = [], 2
+            for idx in range(meta_buffer[1].item()):
+                dtype = self.ID_TO_DTYPE[meta_buffer[offset].item()]
+                ndims = meta_buffer[offset + 1].item()
+                shape = meta_buffer[offset + 2:offset + 2 + ndims].tolist()
+                offset += 2 + ndims
+                buffers.append(self._allocate_or_extend_buffers(idx, shape, dtype))
+            return tuple(buffers) if recv_type == 2 else buffers
+        raise NotImplementedError(f"Could not receive type {recv_type}")
+
+    # Only PipelineEngine metadata helpers are patched here.
+    PipelineEngine._send_tensor_meta = _send_tensor_meta
+    PipelineEngine._recv_tensor_meta = _recv_tensor_meta
+    PipelineEngine._phantora_cpu_meta = True
+
+
+def install_phantora_torchtitan_patches() -> None:
+    """Patch TorchTitan PP shape-inference metadata exchange.
+
+    Used by tests/test_torchtitan.py before constructing TorchTitan Trainer.
+
+    Patch targets:
+      - torchtitan.distributed.utils.init_distributed
+      - torchtitan.models.llama3.infra.pipeline.PipelineStage
+
+    Original: PipelineStage._shape_inference sends/receives meta shapes with
+    dist.send_object_list/recv_object_list using group=self.group,
+    device=self.device, and use_batch=True.
+    Replacement: create a CPU/Gloo group after init_distributed(), then replace
+    TorchTitan's imported PipelineStage with a subclass whose _shape_inference
+    sends/receives the same objects through get_phantora_metadata_process_group().
+    """
+    if os.environ.get("PHANTORA") is None:
+        return
+    try:
+        import torch.distributed as dist
+        import torch.distributed.pipelining.stage as stage_mod
+        from torch.distributed.pipelining import PipelineStage
+        import torchtitan.distributed.utils as tt_dist_utils
+        import torchtitan.models.llama3.infra.pipeline as tt_pipeline
+    except (ImportError, AttributeError):
+        return
+
+    if not getattr(tt_dist_utils.init_distributed, "_phantora_cpu_meta", False):
+        # Original init_distributed initializes the default process group.
+        # Replacement calls it first, then creates the CPU group used below.
+        _orig_init_distributed = tt_dist_utils.init_distributed
+
+        def _init_distributed_with_cpu_group(*args, **kwargs):
+            result = _orig_init_distributed(*args, **kwargs)
+            get_phantora_metadata_process_group()
+            return result
+
+        _init_distributed_with_cpu_group._phantora_cpu_meta = True
+        tt_dist_utils.init_distributed = _init_distributed_with_cpu_group
+
+    if getattr(tt_pipeline.PipelineStage, "_phantora_cpu_meta", False):
+        return
+
+    class CpuMetaPipelineStage(PipelineStage):
+        _phantora_cpu_meta = True
+
+        def _shape_inference(self, args, kwargs=None):
+            # Original: recv/send object-list metadata with self.group/self.device.
+            # Replacement: recv/send the same metadata with get_phantora_metadata_process_group().
+            if kwargs is None:
+                kwargs = {}
+            if self.is_first or self.stage_index_to_group_rank[self.stage_index - 1] == self.group_rank:
+                args = stage_mod.tree_map_only(torch.Tensor, lambda x: x.to("meta"), args)
+            else:
+                objects = [None]
+                pp_group = self.group or dist.distributed_c10d._get_default_group()
+                dist.recv_object_list(
+                    objects,
+                    src=dist.get_global_rank(
+                        pp_group,
+                        self.stage_index_to_group_rank[self.stage_index - 1],
+                    ),
+                    group=get_phantora_metadata_process_group(),
+                )
+                args = objects[0]
+
+            self.inputs_meta = args
+            real_args = stage_mod.tree_map_only(
+                torch.Tensor,
+                lambda x: torch.zeros_like(x, device=self.device),
+                args,
+            )
+            with torch.no_grad():
+                outputs = self.submod(*real_args, **kwargs)
+            if isinstance(outputs, torch.Tensor):
+                outputs = [outputs]
+            outputs_meta = tuple(
+                stage_mod.tree_map_only(torch.Tensor, lambda x: x.to("meta"), outputs)
+            )
+            self._configure_outputs_meta(outputs_meta)
+
+            if self.is_last or self.stage_index_to_group_rank[self.stage_index + 1] == self.group_rank:
+                return outputs_meta
+
+            pp_group = self.group or dist.distributed_c10d._get_default_group()
+            dist.send_object_list(
+                [outputs_meta],
+                dst=dist.get_global_rank(
+                    pp_group,
+                    self.stage_index_to_group_rank[self.stage_index + 1],
+                ),
+                group=get_phantora_metadata_process_group(),
+            )
+            return tuple()
+
+    tt_pipeline.PipelineStage = CpuMetaPipelineStage
+
 
 def enable_function_tracer() -> None:
     if os.environ.get('PHANTORA') is not None:

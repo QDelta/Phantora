@@ -1,101 +1,169 @@
 from phantora_utils import (
-    time_pair,
-    enable_function_tracer,
-    disable_function_tracer,
     RandomTokens,
+    disable_function_tracer,
+    enable_function_tracer,
+    install_phantora_deepspeed_patches,
+    time_pair,
 )
-import torch
-from transformers import LlamaConfig, LlamaForCausalLM
-from torch.utils.data import DataLoader
-import torch.distributed as dist
-import deepspeed
 
-def main(
-    local_rank,
-    num_layers,
-    hidden_size,
-    ffn_hidden_size,
-    num_attention_heads,
-    vocab_size,
-    seq_len,
-    batch_size,
-    local_batches
-):
-    config = LlamaConfig(
-        vocab_size=vocab_size,
-        hidden_size=hidden_size,
-        intermediate_size=ffn_hidden_size,
-        num_hidden_layers=num_layers,
-        num_attention_heads=num_attention_heads,
-        max_position_embeddings=seq_len,
+import argparse
+import os
+
+import torch
+import torch.distributed as dist
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader
+
+import deepspeed
+from deepspeed.pipe import PipelineModule
+from deepspeed.runtime.pipe.topology import PipeModelDataParallelTopology
+from transformers import LlamaConfig, LlamaForCausalLM
+
+
+class LlamaDecoderLayerPipe(nn.Module):
+    # DeepSpeed PipelineModule runs a sequence of layer callables. Keep the
+    # original HF decoder layer and only adapt its PipelineModule I/O shape.
+    def __init__(self, layer: nn.Module):
+        super().__init__()
+        self.layer = layer
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        seq_len = hidden_states.shape[1]
+        position_ids = torch.arange(seq_len, device=hidden_states.device).unsqueeze(0)
+        return self.layer(hidden_states, position_ids=position_ids, use_cache=False)[0]
+
+
+def causal_lm_loss(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+    # PipelineModule computes loss outside LlamaForCausalLM.forward(labels=...),
+    # so reproduce HF causal-LM's shifted-token cross entropy here.
+    shift_logits = logits[..., :-1, :].contiguous().float()
+    shift_labels = labels[..., 1:].contiguous()
+    return F.cross_entropy(
+        shift_logits.view(-1, shift_logits.size(-1)),
+        shift_labels.view(-1),
     )
-    config._attn_implementation = "flash_attention_2"
+
+
+def build_pipeline_model(args: argparse.Namespace) -> PipelineModule:
+    config = LlamaConfig(
+        vocab_size=args.vocab_size,
+        hidden_size=args.hidden_size,
+        intermediate_size=args.ffn_hidden_size,
+        num_hidden_layers=args.num_layers,
+        num_attention_heads=args.num_attention_heads,
+        max_position_embeddings=args.sequence_length,
+        use_cache=False,
+        attn_implementation="flash_attention_2",
+    )
 
     dtype_orig = torch.get_default_dtype()
     torch.set_default_dtype(torch.bfloat16)
-    with torch.device('meta'):
-        model = LlamaForCausalLM(config)
-    model = model.to_empty(device=local_rank)
-    torch.set_default_dtype(dtype_orig)
-    print(f"Model size: {sum(p.numel() for p in model.parameters())}")
+    try:
+        llama = LlamaForCausalLM(config)
+    finally:
+        torch.set_default_dtype(dtype_orig)
+    if args.tensor_parallel_size > 1:
+        llama = deepspeed.tp_model_init(
+            llama,
+            tp_size=args.tensor_parallel_size,
+            dtype=torch.bfloat16,
+        )
+    layers = [
+        llama.model.embed_tokens,
+        *(LlamaDecoderLayerPipe(layer) for layer in llama.model.layers),
+        llama.model.norm,
+        llama.lm_head,
+    ]
+    topology = None
+    if args.tensor_parallel_size > 1:
+        topology = PipeModelDataParallelTopology(
+            num_pp=args.pipeline_parallel_size,
+            num_mp=args.tensor_parallel_size,
+            num_dp=args.data_parallel_size,
+        )
+    return PipelineModule(
+        layers=layers,
+        num_stages=None if topology is not None else args.pipeline_parallel_size,
+        topology=topology,
+        loss_fn=causal_lm_loss,
+        partition_method="uniform",
+        dynamic_shape=False,
+    )
 
-    dataset = RandomTokens(config.vocab_size, seq_len, local_batches * batch_size)
-    data_loader = DataLoader(dataset, batch_size=batch_size)
+
+def main(args: argparse.Namespace) -> None:
+    local_rank = int(os.environ.get("LOCAL_RANK", args.local_rank or 0))
+    torch.cuda.set_device(local_rank)
 
     deepspeed.init_distributed()
+    install_phantora_deepspeed_patches()
+
+    world_size = dist.get_world_size()
+    rank = dist.get_rank()
+    model_parallel_size = args.pipeline_parallel_size * args.tensor_parallel_size
+    if world_size % model_parallel_size != 0:
+        raise ValueError(
+            "WORLD_SIZE must be divisible by "
+            "pipeline_parallel_size * tensor_parallel_size"
+        )
+    args.data_parallel_size = world_size // model_parallel_size
+    train_batch_size = args.micro_batch_size * args.gradient_accumulation * (
+        args.data_parallel_size
+    )
+
+    model = build_pipeline_model(args)
+    if rank == 0:
+        print(f"Model size: {sum(p.numel() for p in model.parameters())}")
+
     model_engine, _, _, _ = deepspeed.initialize(
         model=model,
-        model_parameters=model.parameters(),
+        model_parameters=[p for p in model.parameters() if p.requires_grad],
         config={
-            "train_micro_batch_size_per_gpu": batch_size,
-            "optimizer": {
-                "type": "Adam",
-                "params": {
-                    "torch_adam": True,
-                    "lr": 5e-5,
-                },
-            },
-            "bf16": {
-                "enabled": True,
-            },
-            "zero_optimization": {
-                "stage": 3,
-                "overlap_comm": True,
-                "allgather_bucket_size": 2e8,
-                "reduce_bucket_size": 2e8,
-            },
+            "train_micro_batch_size_per_gpu": args.micro_batch_size,
+            "gradient_accumulation_steps": args.gradient_accumulation,
+            "train_batch_size": train_batch_size,
+            "steps_per_print": 1000000,
+            "optimizer": {"type": "AdamW", "params": {"torch_adam": True, "lr": 5e-5}},
+            "bf16": {"enabled": True},
+            "gradient_clipping": 0.0,
+            "zero_optimization": {"stage": 0},
+            "pipeline": {"pipe_partitioned": False, "grad_partitioned": False},
+            "wall_clock_breakdown": False,
         },
     )
 
-    enable_function_tracer()
-    duras = []
-    duras_wall = []
-    for source, label in data_loader:
-        start, start_wall = time_pair()
-        source = source.to(local_rank)
-        label = label.to(local_rank)
-        loss = model_engine(source, labels=label).loss
-        model_engine.backward(loss)
-        model_engine.step()
-        loss.cpu()  # trigger sync
-        end, end_wall = time_pair()
-        print(f"time: {end - start:.2f} wall: {end_wall - start_wall:.2f}\n", end="")
-        duras.append(end - start)
-        duras_wall.append(end_wall - start_wall)
-    dist.destroy_process_group()
-    disable_function_tracer()
-
-    output = f"Time: {duras} Avg time: {sum(duras[1:]) / (len(duras) - 1)}\n"
-    output += (
-        f"Wall: {duras_wall} Avg wall: {sum(duras_wall[1:]) / (len(duras_wall) - 1)}\n"
+    dataset = RandomTokens(
+        args.vocab_size,
+        args.sequence_length,
+        (args.iterations * args.gradient_accumulation + 2) * args.micro_batch_size,
     )
-    print(output, end="")
+    data_iter = iter(DataLoader(dataset, batch_size=args.micro_batch_size))
+
+    enable_function_tracer()
+    duras, duras_wall = [], []
+    try:
+        for i in range(args.iterations):
+            start, start_wall = time_pair()
+            loss = model_engine.train_batch(data_iter=data_iter)
+            torch.cuda.synchronize()
+            end, end_wall = time_pair()
+            if rank == 0:
+                print(f"rank {rank} iter {i} loss: {float(loss.detach().cpu()):.4f} time: {end - start:.2f} wall: {end_wall - start_wall:.2f}")
+            duras.append(end - start)
+            duras_wall.append(end_wall - start_wall)
+    finally:
+        disable_function_tracer()
+        dist.destroy_process_group()
+
+    print(f"Rank {rank} Time: {duras} Avg Time: {sum(duras[1:]) / (len(duras) - 1):.2f}\n", end="")
+    print(f"Rank {rank} Wall: {duras_wall} Avg Wall: {sum(duras_wall[1:]) / (len(duras_wall) - 1):.2f}\n", end="")
 
 
 if __name__ == "__main__":
-    import argparse
-
     parser = argparse.ArgumentParser()
+    parser.add_argument("--pipeline_parallel_size", type=int, default=1)
+    parser.add_argument("--tensor_parallel_size", type=int, default=1)
     parser.add_argument("--num_layers", type=int, default=32)
     parser.add_argument("--hidden_size", type=int, default=4096)
     parser.add_argument("--ffn_hidden_size", type=int, default=11008)
@@ -103,17 +171,7 @@ if __name__ == "__main__":
     parser.add_argument("--vocab_size", type=int, default=32000)
     parser.add_argument("--sequence_length", type=int, default=4096)
     parser.add_argument("--micro_batch_size", type=int, default=1)
+    parser.add_argument("--gradient_accumulation", type=int, default=1)
     parser.add_argument("--iterations", type=int, default=4)
     parser.add_argument("--local_rank", type=int)
-    args = parser.parse_args()
-    main(
-        args.local_rank,
-        args.num_layers,
-        args.hidden_size,
-        args.ffn_hidden_size,
-        args.num_attention_heads,
-        args.vocab_size,
-        args.sequence_length,
-        args.micro_batch_size,
-        args.iterations
-    )
+    main(parser.parse_args())

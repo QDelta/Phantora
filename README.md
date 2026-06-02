@@ -46,7 +46,6 @@ Phantora ships a stub `libnccl.so` that intercepts NCCL calls and forwards them 
 | `ncclSend` (point-to-point) | ✅ Supported |
 | `ncclRecv` (point-to-point) | ✅ Supported |
 
-`ncclSend` / `ncclRecv` are simulated for timing and stream ordering, including calls batched by `ncclGroupStart` / `ncclGroupEnd`. Phantora does not copy tensor payloads between ranks; receive buffers contain whatever simulated CUDA memory already holds. Framework paths that inspect data sent over NCCL, including shape or dtype metadata encoded in tensors, may still fail or diverge.
 
 **Communicator, group, and utility calls**
 
@@ -71,16 +70,16 @@ The matrix below summarises which features of each supported framework Phantora 
 | Feature | Megatron | DeepSpeed | TorchTitan | Required collective(s) |
 | --- | :---: | :---: | :---: | --- |
 | Data parallelism (DP) | ✅ | ✅ | ✅ | AllReduce |
-| Tensor parallelism (TP) | ✅ | ✅ (via Megatron-LM) | ✅ | AllReduce, AllGather, ReduceScatter |
+| Tensor parallelism (TP) | ✅ | ✅ | ✅ | AllReduce, AllGather, ReduceScatter |
 | ZeRO-1 / ZeRO-2 / ZeRO-3 | — | ✅ | — | AllReduce, AllGather, ReduceScatter |
 | FSDP / FSDP2 | — | — | ✅ | AllGather, ReduceScatter |
 | Activation checkpointing | ✅ | ✅ | ✅ | (no extra communication) |
-| Pipeline parallelism (PP) | ✅ | 🚧 | 🚧 | `ncclSend` / `ncclRecv`; DeepSpeed and TorchTitan also need data-carrying metadata exchange |
+| Pipeline parallelism (PP) | ✅ | ✅ | ✅ | `ncclSend` / `ncclRecv` |
 | Expert parallelism / MoE | 🚧 | 🚧 | 🚧 | All-to-all via grouped `ncclSend` / `ncclRecv`, payload/routing semantics, and/or [DeepEP](https://github.com/deepseek-ai/DeepEP) |
 
-Two remaining limitations gate the 🚧 rows:
+Important limitations remain:
 
-- **Payload-free NCCL simulation.** Phantora models the timing and ordering of point-to-point transfers, but it does not transfer bytes between ranks. The Megatron pipeline test derives activation tensor metadata locally from the model configuration, so it can run on top of timing-only P2P. DeepSpeed and TorchTitan pipeline paths exchange shape, dtype, or object metadata over distributed send/recv before the activation transfer; because those metadata bytes are not delivered under simulation, those PP paths are not supported yet.
+- **Payload-free NCCL simulation.** Phantora models the timing and ordering of point-to-point transfers, but it does not transfer bytes between ranks. Framework paths that inspect activation values or other transferred tensor payloads need to use a CPU backend path for now.
 - **DeepEP — on the roadmap.** Some recent MoE training stacks (e.g., DeepSeek-style models) bypass NCCL entirely and use [DeepEP](https://github.com/deepseek-ai/DeepEP) for expert dispatch/combine. We plan to add a DeepEP interception layer so those stacks can be simulated as well.
 
 Rows marked `—` mean the feature does not exist in that framework. If you'd like to help land any of the in-progress pieces sooner, contributions are very welcome — see [Contributing](#contributing).

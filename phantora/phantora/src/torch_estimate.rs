@@ -72,14 +72,14 @@ impl TorchEstimator {
         let kind = info.dtype;
         let total_size = shape.iter().product();
         match self.tensor_cache.get(&(total_size, kind)) {
-            Some(t) => t.view_(shape),
+            Some(t) => t.contiguous().view(shape),
             None => {
                 let t = match kind_range(kind) {
                     KindRange::Bool => Tensor::randint(2, shape, (kind, Device::Cuda(0))),
                     KindRange::Integer => Tensor::randint(128, shape, (kind, Device::Cuda(0))),
                     KindRange::Float => Tensor::randn(shape, (kind, Device::Cuda(0))),
                 };
-                self.tensor_cache.put((total_size, kind), t.view_(shape));
+                self.tensor_cache.put((total_size, kind), t.contiguous());
                 t
             }
         }
@@ -93,7 +93,7 @@ impl TorchEstimator {
         if let Device::Cuda(0) = t.device() {
             let total_size = t.size().iter().product();
             let kind = t.kind();
-            self.tensor_cache.put((total_size, kind), t);
+            self.tensor_cache.put((total_size, kind), t.contiguous());
         }
     }
 
@@ -118,7 +118,7 @@ impl TorchEstimator {
                 let t2 = self.allocate(info2);
                 let bias = bias_info.as_ref().map(|info| self.allocate(info));
                 let (result, dur) =
-                    estimate_torch!(niter, t1.linear::<&Tensor>(&t2, bias.as_ref()));
+                    estimate_torch!(niter, t1.linear::<&Tensor>(&t2, bias.as_ref()), info2.dtype);
                 self.cache(result);
                 dur
             }
