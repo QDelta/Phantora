@@ -115,30 +115,34 @@ def install_phantora_deepspeed_patches() -> None:
 
     get_phantora_metadata_process_group()
 
-    BF16_Optimizer = ds_bf16.BF16_Optimizer
-    if not getattr(BF16_Optimizer.step, "_phantora_skip_zero_norm_assert", False):
-        # Patch target: deepspeed.runtime.bf16_optimizer.BF16_Optimizer.step.
-        # Original: computes all_groups_norm, stores self._global_grad_norm, then
-        # unconditionally asserts all_groups_norm > 0 before optional grad clipping.
-        # Replacement: patch only that assert line so positive norm is required
-        # only when DeepSpeed will actually clip gradients.
-        import inspect
-        import textwrap
+    def _positive_norm(norm):
+        if torch.is_tensor(norm):
+            return torch.where(norm > 0, norm, torch.ones_like(norm))
+        return norm if norm > 0 else 1.0
 
-        source = textwrap.dedent(inspect.getsource(BF16_Optimizer.step))
-        old = "\n    assert all_groups_norm > 0.\n    if self.clip_grad > 0.:\n"
-        new = (
-            "\n    if self.clip_grad > 0.:\n"
-            "        assert all_groups_norm > 0.\n"
-            "    if self.clip_grad > 0.:\n"
-        )
-        if old not in source:
-            raise RuntimeError("DeepSpeed BF16_Optimizer.step assert layout changed")
-        namespace = dict(ds_bf16.__dict__)
-        exec(compile(source.replace(old, new), ds_bf16.__file__, "exec"), namespace)
-        step = namespace["step"]
-        step._phantora_skip_zero_norm_assert = True
-        BF16_Optimizer.step = step
+    if not getattr(ds_bf16.get_global_norm_of_tensors, "_phantora_positive_norm", False):
+        # Patch target: deepspeed.runtime.bf16_optimizer.get_global_norm_of_tensors.
+        # Original: may return zero when Phantora does not preserve gradient values.
+        # Replacement: keep the original norm unless it is non-positive.
+        _orig_get_global_norm_of_tensors = ds_bf16.get_global_norm_of_tensors
+
+        def get_global_norm_of_tensors(*args, **kwargs):
+            return _positive_norm(_orig_get_global_norm_of_tensors(*args, **kwargs))
+
+        get_global_norm_of_tensors._phantora_positive_norm = True
+        ds_bf16.get_global_norm_of_tensors = get_global_norm_of_tensors
+
+    if not getattr(ds_bf16.get_norm_with_moe_layers, "_phantora_positive_norm", False):
+        # Patch target: deepspeed.runtime.bf16_optimizer.get_norm_with_moe_layers.
+        # Original: may return zero after combining MoE/non-MoE norms.
+        # Replacement: keep the original norm unless it is non-positive.
+        _orig_get_norm_with_moe_layers = ds_bf16.get_norm_with_moe_layers
+
+        def get_norm_with_moe_layers(*args, **kwargs):
+            return _positive_norm(_orig_get_norm_with_moe_layers(*args, **kwargs))
+
+        get_norm_with_moe_layers._phantora_positive_norm = True
+        ds_bf16.get_norm_with_moe_layers = get_norm_with_moe_layers
 
     PipelineEngine = ds_engine.PipelineEngine
     if getattr(PipelineEngine, "_phantora_cpu_meta", False):
