@@ -52,7 +52,9 @@ def build_pipeline_model(args: argparse.Namespace) -> PipelineModule:
         intermediate_size=args.ffn_hidden_size,
         num_hidden_layers=args.num_layers,
         num_attention_heads=args.num_attention_heads,
+        num_key_value_heads=args.num_key_value_heads,
         max_position_embeddings=args.sequence_length,
+        rope_theta=args.rope_theta,
         use_cache=False,
         attn_implementation="flash_attention_2",
     )
@@ -168,7 +170,10 @@ if __name__ == "__main__":
     parser.add_argument("--hidden_size", type=int, default=4096)
     parser.add_argument("--ffn_hidden_size", type=int, default=11008)
     parser.add_argument("--num_attention_heads", type=int, default=32)
+    parser.add_argument("--num_key_value_heads", type=int, default=None,
+        help="Number of KV heads for GQA (None = MHA, i.e., equal to num_attention_heads).")
     parser.add_argument("--vocab_size", type=int, default=32000)
+    parser.add_argument("--rope_theta", type=float, default=10000.0)
     parser.add_argument("--sequence_length", type=int, default=4096)
     parser.add_argument("--micro_batch_size", type=int, default=1)
     parser.add_argument("--gradient_accumulation", type=int, default=1)
