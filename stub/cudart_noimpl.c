@@ -107,7 +107,7 @@ cudaThreadSetCacheConfig(enum cudaFuncCache cacheConfig)
 const char*
 cudaGetErrorName(cudaError_t error)
 {
-    NOT_IMPLEMENTED;
+    return "cudaErrorUnknown";
 }
 
 cudaError_t

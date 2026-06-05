@@ -275,19 +275,22 @@ ncclCommDeregister(const ncclComm_t comm, void* handle)
 ncclResult_t
 ncclCommCount(const ncclComm_t comm, int* count)
 {
-    NOT_IMPLEMENTED;
+    *count = comm->nranks;
+    return ncclSuccess;
 }
 
 ncclResult_t
 ncclCommCuDevice(const ncclComm_t comm, int* device)
 {
-    NOT_IMPLEMENTED;
+    *device = _get_current_device();
+    return ncclSuccess;
 }
 
 ncclResult_t
 ncclCommUserRank(const ncclComm_t comm, int* rank)
 {
-    NOT_IMPLEMENTED;
+    *rank = comm->rank;
+    return ncclSuccess;
 }
 
 ncclResult_t

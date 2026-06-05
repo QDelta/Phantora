@@ -300,6 +300,162 @@ def install_phantora_torchtitan_patches() -> None:
     tt_pipeline.PipelineStage = CpuMetaPipelineStage
 
 
+def install_phantora_megatron_moe_patches() -> None:
+    """Make Megatron-core MoE runnable under Phantora's payload-free simulation.
+
+    Used by tests/test_megatron.py when num_moe_experts is set. Assumes experts are
+    LOAD BALANCED (each rank routes an equal share of tokens to every expert).
+
+    Under simulation the GPU kernels never actually run, so *values* read back from
+    any GPU tensor are garbage. MoE is the first path whose control flow depends on
+    tensor values (the router decides token->expert; the dispatch counts, all-to-all
+    split sizes and permutation index sets are all derived from that). The fix does
+    NOT try to compute a correct routing on the GPU (impossible here); instead it
+    makes the *shapes* analytic and correct — which is all the simulator needs,
+    since PyTorch still computes output shapes on the CPU from input numel while the
+    kernel data stays garbage. Megatron's collective calls themselves are untouched.
+
+    Three patches:
+      1. Bind ``moe_utils.te_general_gemm = None``: megatron-core 0.13.1 references
+         it in the router gating without guarding on HAVE_TE, raising NameError when
+         Transformer Engine is absent. With it None the router uses the torch GEMM.
+      2. ``moe_utils.permute`` (and the copy imported into ``token_dispatcher``):
+         the real code builds ``sorted_indices`` via ``masked_select`` of the
+         garbage routing map, so its length is garbage and the following
+         ``index_select`` allocates a multi-TB tensor. When ``num_out_tokens`` is
+         known (dropless => num_tokens*topk), build ``sorted_indices`` with exactly
+         that length instead (values irrelevant; only the shape drives the
+         simulated permute).
+      3. ``MoEAlltoAllTokenDispatcher.preprocess``: it derives input/output splits
+         and per-expert counts from the garbage routing map and a count gather.
+         Run the original (keeps those kernels in the timeline) but overwrite the
+         split/count attributes with the analytic uniform values implied by load
+         balancing, as real CPU tensors, so the expert all-to-all and the second
+         permutation are sized correctly. The all-to-all itself is still simulated.
+    """
+    if os.environ.get("PHANTORA") is None:
+        return
+    try:
+        import megatron.core.transformer.moe.moe_utils as moe_utils
+        import megatron.core.transformer.moe.token_dispatcher as token_dispatcher
+        from megatron.core.transformer.moe.token_dispatcher import (
+            MoEAlltoAllTokenDispatcher,
+        )
+    except (ImportError, AttributeError):
+        return
+
+    # (1) Transformer-Engine-absence shim for the router gating GEMM.
+    if not hasattr(moe_utils, "te_general_gemm"):
+        moe_utils.te_general_gemm = None
+
+    # (2) Correct-length permutation index set (shape, not values).
+    if not getattr(moe_utils, "_phantora_permute_patched", False):
+        _orig_permute = moe_utils.permute
+
+        def _phantora_permute(
+            tokens, routing_map, probs=None, num_out_tokens=None,
+            fused=False, drop_and_pad=False,
+        ):
+            if fused or drop_and_pad or num_out_tokens is None:
+                return _orig_permute(
+                    tokens, routing_map, probs, num_out_tokens, fused, drop_and_pad
+                )
+            n_out = int(num_out_tokens)
+            # Right length, on the right device; contents are irrelevant under
+            # payload-free simulation (the index_select kernel never really runs).
+            sorted_indices = torch.empty(n_out, dtype=torch.long, device=tokens.device)
+            permuted_input = tokens.index_select(0, sorted_indices)
+            # permuted_probs must stay connected to `probs` in the autograd graph so
+            # the router gating weight still receives a gradient (else Megatron's DDP
+            # bucket asserts "grad not available"). n_out = num_tokens*topk <= probs
+            # .numel() (topk <= num_experts), so a flattened slice has the right shape.
+            permuted_probs = None if probs is None else probs.reshape(-1)[:n_out]
+            return permuted_input, permuted_probs, sorted_indices
+
+        moe_utils.permute = _phantora_permute
+        # token_dispatcher imported `permute` into its own namespace.
+        if hasattr(token_dispatcher, "permute"):
+            token_dispatcher.permute = _phantora_permute
+        moe_utils._phantora_permute_patched = True
+
+    # (3) Analytic uniform dispatch metadata.
+    if not getattr(MoEAlltoAllTokenDispatcher, "_phantora_balanced", False):
+        _orig_preprocess = MoEAlltoAllTokenDispatcher.preprocess
+
+        def _phantora_preprocess(self, routing_map):
+            # Run the original for timeline fidelity (count gather etc.), then
+            # overwrite the garbage-derived sizes with the load-balanced values.
+            tokens_per_expert = _orig_preprocess(self, routing_map)
+            num_tokens = routing_map.size(0)
+            topk = self.config.moe_router_topk
+            routed = num_tokens * topk
+            ne, nle = self.num_experts, self.num_local_experts
+            ep, tp = self.ep_size, self.tp_size
+            per_expert = routed // ne  # tokens this rank sends to each expert
+            dev = self.permute_idx_device
+            long = torch.long
+            self.num_out_tokens = routed
+            if ep > 1 or tp > 1:
+                # input_splits/output_splits are consumed by dist.all_to_all_single,
+                # which requires List[int] (the dispatcher's DtoH helper only numpy-
+                # ifies CUDA tensors; our CPU values must already be the final form).
+                # Under load balance every rank is identical => symmetric all-to-all.
+                self.input_splits = [per_expert * nle] * ep
+                self.output_splits = [per_expert * nle] * ep
+                # output_splits_tp sizes the TP all-gather in dispatch_postprocess;
+                # it must sum to tp*ep*nle*per_expert (== num_global_tokens_per_local_expert
+                # sum) so the gathered tensor matches the subsequent sort_chunks split.
+                # Megatron: output_splits_tp[i] = sum_ep num_global_tokens_per_rank = ep*nle*per_expert.
+                # Has .tolist() called on it -> keep it array-like (numpy).
+                self.output_splits_tp = (
+                    None if tp == 1
+                    else torch.full((tp,), ep * nle * per_expert, dtype=long).numpy()
+                )
+                # [tp*ep, num_local_experts]: tokens each sender group sends to
+                # each of this rank's local experts.
+                self.num_global_tokens_per_local_expert = torch.full(
+                    (tp * ep, nle), per_expert, dtype=long, device=dev
+                )
+                tokens_per_expert = torch.full(
+                    (nle,), per_expert * tp * ep, dtype=long, device="cpu"
+                )
+            else:
+                self.num_global_tokens_per_local_expert = torch.full(
+                    (ne,), per_expert, dtype=long, device=dev
+                )
+                tokens_per_expert = torch.full((ne,), per_expert, dtype=long, device="cpu")
+            return tokens_per_expert
+
+        MoEAlltoAllTokenDispatcher.preprocess = _phantora_preprocess
+        MoEAlltoAllTokenDispatcher._phantora_balanced = True
+
+    # (4) EP+TP requires sequence parallelism, but the torch LayerNorm/RMSNorm
+    # fallback (used without Apex/TE) asserts it "does not support sequence
+    # parallel" in WrappedTorchNorm.__new__. The assert is conservative: the norm
+    # is per-token over the hidden dim and is SP-agnostic (SP's comms live in the
+    # surrounding linear layers). Let it build by clearing config.sequence_parallel
+    # just for construction, then restoring it. No-op when SP is off (dense/EP=1).
+    try:
+        from megatron.core.transformer.torch_norm import WrappedTorchNorm
+    except (ImportError, AttributeError):
+        WrappedTorchNorm = None
+    if WrappedTorchNorm is not None and not getattr(
+        WrappedTorchNorm, "_phantora_sp_ok", False
+    ):
+        _orig_norm_new = WrappedTorchNorm.__new__
+
+        def _phantora_norm_new(cls, config, *args, **kwargs):
+            sp = config.sequence_parallel
+            config.sequence_parallel = False
+            try:
+                return _orig_norm_new(cls, config, *args, **kwargs)
+            finally:
+                config.sequence_parallel = sp
+
+        WrappedTorchNorm.__new__ = staticmethod(_phantora_norm_new)
+        WrappedTorchNorm._phantora_sp_ok = True
+
+
 def enable_function_tracer() -> None:
     if os.environ.get('PHANTORA') is not None:
         prefix = os.environ['PHANTORA_SOCKET_PREFIX']
