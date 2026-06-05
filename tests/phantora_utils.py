@@ -456,6 +456,44 @@ def install_phantora_megatron_moe_patches() -> None:
         WrappedTorchNorm._phantora_sp_ok = True
 
 
+def install_phantora_gpt_oss_patches() -> None:
+    """Make HF gpt-oss MoE runnable under Phantora's payload-free simulation.
+
+    Used by tests/test_deepspeed.py when --model gpt_oss.
+
+    gpt-oss's GptOssExperts has two paths: a training/sparse path that does
+    ``one_hot(router_indices)`` then ``.nonzero()`` to find hit experts and gathers
+    tokens per expert (all data-dependent sizes), and a dense path that computes
+    every expert for every token with FIXED shapes [num_experts, num_tokens,
+    hidden] and ignores router_indices. Under simulation the router indices are
+    garbage, so the sparse path's ``.nonzero()`` returns a garbage-sized tensor
+    (numel overflow / multi-GB balloon). Force the dense path by flipping the
+    module's ``training`` flag off just for the experts forward (autograd still
+    flows, so backward/timing are unaffected).
+    """
+    if os.environ.get("PHANTORA") is None:
+        return
+    try:
+        from transformers.models.gpt_oss import modeling_gpt_oss as gpt_oss
+        GptOssExperts = gpt_oss.GptOssExperts
+    except (ImportError, AttributeError):
+        return
+    if getattr(GptOssExperts, "_phantora_dense", False):
+        return
+    _orig_experts_forward = GptOssExperts.forward
+
+    def _dense_experts_forward(self, hidden_states, router_indices=None, routing_weights=None):
+        was_training = self.training
+        self.training = False  # select the fixed-shape dense expert path
+        try:
+            return _orig_experts_forward(self, hidden_states, router_indices, routing_weights)
+        finally:
+            self.training = was_training
+
+    GptOssExperts.forward = _dense_experts_forward
+    GptOssExperts._phantora_dense = True
+
+
 def enable_function_tracer() -> None:
     if os.environ.get('PHANTORA') is not None:
         prefix = os.environ['PHANTORA_SOCKET_PREFIX']

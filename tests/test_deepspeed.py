@@ -3,6 +3,7 @@ from phantora_utils import (
     disable_function_tracer,
     enable_function_tracer,
     install_phantora_deepspeed_patches,
+    install_phantora_gpt_oss_patches,
     time_pair,
 )
 
@@ -209,6 +210,7 @@ def build_gpt_oss(args: argparse.Namespace) -> nn.Module:
     """
     from transformers import GptOssConfig, GptOssForCausalLM
 
+    install_phantora_gpt_oss_patches()
     config = GptOssConfig(
         vocab_size=args.vocab_size,
         hidden_size=args.hidden_size,
