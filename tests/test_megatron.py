@@ -108,6 +108,7 @@ def get_model(
     moe_router_topk=2,
     moe_token_dispatcher_type="alltoall",
     expert_model_parallel_size=1,
+    kv_channels=None,
 ):
     # MoE config is only added when num_moe_experts is set, so dense models are
     # unchanged. moe_token_dispatcher_type="alltoall" is what makes Megatron emit
@@ -134,6 +135,8 @@ def get_model(
         ffn_hidden_size=ffn_hidden_size,
         num_attention_heads=num_attention_heads,
         num_query_groups=num_query_groups,
+        # head_dim; None -> Megatron's default hidden_size // num_attention_heads.
+        kv_channels=kv_channels,
         gated_linear_unit=swiglu,
         activation_func=torch.nn.functional.silu if swiglu else torch.nn.functional.gelu,
         normalization=normalization,
@@ -267,6 +270,7 @@ def main(
     moe_router_topk=2,
     moe_token_dispatcher_type="alltoall",
     expert_model_parallel_size=1,
+    kv_channels=None,
 ):
     world_size = int(os.environ["WORLD_SIZE"])
     rank = int(os.environ["RANK"])
@@ -316,6 +320,7 @@ def main(
             moe_router_topk=moe_router_topk,
             moe_token_dispatcher_type=moe_token_dispatcher_type,
             expert_model_parallel_size=expert_model_parallel_size,
+            kv_channels=kv_channels,
         )
         model = model.to(device)
         model.train()
@@ -345,6 +350,7 @@ def main(
                 moe_router_topk=moe_router_topk,
                 moe_token_dispatcher_type=moe_token_dispatcher_type,
                 expert_model_parallel_size=expert_model_parallel_size,
+                kv_channels=kv_channels,
             )
             model_chunk = model_chunk.to(device)
             model_chunk.train()
@@ -464,6 +470,8 @@ if __name__ == "__main__":
     parser.add_argument("--moe_token_dispatcher_type", type=str, default="alltoall",
         choices=["allgather", "alltoall"])
     parser.add_argument("--expert_model_parallel_size", type=int, default=1)
+    parser.add_argument("--kv_channels", type=int, default=None,
+        help="Attention head_dim; None = hidden_size // num_attention_heads.")
     args = parser.parse_args()
 
     enable_function_tracer()
@@ -491,5 +499,6 @@ if __name__ == "__main__":
         moe_router_topk=args.moe_router_topk,
         moe_token_dispatcher_type=args.moe_token_dispatcher_type,
         expert_model_parallel_size=args.expert_model_parallel_size,
+        kv_channels=args.kv_channels,
     )
     disable_function_tracer()
