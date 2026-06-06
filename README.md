@@ -26,6 +26,7 @@ Phantora simulates GPU computation and communication, but the tensor values prod
 Concretely:
 
 - **Megatron**: gradient clipping must be disabled. It copies a norm to CPU and takes a `sqrt`, which can fault on the random GPU memory contents under simulation.
+- **MoE routing** is inherently data-dependent: the router picks experts from logits, and the dispatch counts / all-to-all split sizes / permutation indices all follow from that choice. Under simulation those are garbage, so Phantora's MoE support assumes **load-balanced experts** and makes the dispatch *shapes* analytic and uniform instead (see [Framework feature support](#framework-feature-support)). Don't rely on simulated routing decisions or per-expert token counts being realistic.
 - Avoid early-stopping logic or NaN/inf rescue paths in the iterations being simulated.
 - Stick to control flow that depends only on hyperparameters, iteration counts, and configuration. This covers the common case in LLM pre-training.
 
@@ -58,14 +59,14 @@ Phantora ships a stub `libnccl.so` that intercepts NCCL calls and forwards them 
 | `ncclCommRegister`, `ncclCommDeregister` | ✅ Supported (no-op) |
 | `ncclGroupStart`, `ncclGroupEnd` | ✅ Supported |
 | `ncclGetUniqueId`, `ncclGetVersion`, `ncclGetErrorString`, `ncclGetLastError`, `ncclCommGetAsyncError` | ✅ Supported |
-| `ncclCommCount`, `ncclCommCuDevice`, `ncclCommUserRank` | ❌ Not implemented |
-| `ncclRedOpCreatePreMulSum`, `ncclRedOpDestroy` | ❌ Not implemented |
+| `ncclCommCount`, `ncclCommCuDevice`, `ncclCommUserRank` | ✅ Supported |
+| `ncclRedOpCreatePreMulSum`, `ncclRedOpDestroy` | ✅ Supported (PreMulSum modeled as sum) |
 
 The full set of stubs lives in [`stub/nccl.c`](stub/nccl.c). Pull requests to expand NCCL coverage are very welcome.
 
 ### Framework feature support
 
-The matrix below summarises which features of each supported framework Phantora can simulate today. A 🚧 row maps to an unsupported API, missing communication semantics, or a separate communication library that Phantora does not yet intercept.
+The matrix below summarises which features of each supported framework Phantora can simulate today. A ✅ row is simulated end-to-end; a footnote marker (¹) flags a row whose support carries a caveat spelled out in the notes below.
 
 | Feature | Megatron | DeepSpeed | TorchTitan | Required collective(s) |
 | --- | :---: | :---: | :---: | --- |
@@ -75,11 +76,14 @@ The matrix below summarises which features of each supported framework Phantora 
 | FSDP / FSDP2 | — | — | ✅ | AllGather, ReduceScatter |
 | Activation checkpointing | ✅ | ✅ | ✅ | (no extra communication) |
 | Pipeline parallelism (PP) | ✅ | ✅ | ✅ | `ncclSend` / `ncclRecv` |
-| Expert parallelism / MoE | 🚧 | 🚧 | 🚧 | All-to-all via grouped `ncclSend` / `ncclRecv`, payload/routing semantics, and/or [DeepEP](https://github.com/deepseek-ai/DeepEP) |
+| Expert parallelism / MoE | ✅¹ | ✅¹ | ✅¹ | All-to-all via grouped `ncclSend` / `ncclRecv` |
+
+¹ Under a **load-balanced-experts** assumption — see the MoE note below.
 
 Important limitations remain:
 
 - **Payload-free NCCL simulation.** Phantora models the timing and ordering of point-to-point transfers, but it does not transfer bytes between ranks. Framework paths that inspect activation values or other transferred tensor payloads need to use a CPU backend path for now.
+- **MoE assumes load-balanced experts.** Because expert routing reads garbage tensor values under payload-free simulation (see [Control flow must be data-independent](#control-flow-must-be-data-independent)), Phantora's framework shims in [`tests/phantora_utils.py`](tests/phantora_utils.py) replace the data-dependent dispatch sizing with the analytic *uniform* distribution: every expert receives an equal share of tokens. The expert all-to-all itself is still simulated, so this gives a faithful throughput/MFU estimate for a balanced workload, but it does not model routing imbalance, capacity overflow, or token dropping. Covered today: Megatron (EP, and TP+EP with sequence parallelism), DeepSpeed (`deepspeed.moe` expert-parallel all-to-all, and the Hugging Face gpt-oss architecture whose experts run locally per rank), and TorchTitan (qwen3 expert parallelism). See the presets under [`tests/docker/*/`](tests/docker).
 - **DeepEP — on the roadmap.** Some recent MoE training stacks (e.g., DeepSeek-style models) bypass NCCL entirely and use [DeepEP](https://github.com/deepseek-ai/DeepEP) for expert dispatch/combine. We plan to add a DeepEP interception layer so those stacks can be simulated as well.
 
 Rows marked `—` mean the feature does not exist in that framework. If you'd like to help land any of the in-progress pieces sooner, contributions are very welcome — see [Contributing](#contributing).
@@ -138,9 +142,17 @@ python3 config_gen.py --nhost 4 --ngpu 4 --vram_mib 143771
 
 Similar for DeepSpeed and TorchTitan.
 
-For TorchTitan, the `tokenizer.model` of Llama3 is needed, you can get it from its [huggingface repo](https://huggingface.co/meta-llama/Meta-Llama-3-8B-Instruct/blob/main/original/tokenizer.model). Place `tokenizer.model` in `tests/assets` before starting.
+TorchTitan (≥ 0.2.0) loads a Hugging Face tokenizer **directory** (`tokenizer.json` + config) via `hf_assets_path`, not a tiktoken `.model` file. Place any HF tokenizer in `tests/assets/hf_tokenizer/` before starting — under payload-free simulation only its vocab size matters (it sets the embedding dimensions). The Llama3 tokenizer works, or any ungated one (e.g. `openai-community/gpt2`).
 
 `run.sh` will pass its arguments to the corresponding scripts (`tests/test_{megatron,deepspeed,torchtitan}.py`)
+
+### Mixture-of-Experts presets
+
+Ready-made MoE configurations live under `tests/docker/`. They exercise the expert all-to-all (and, for FSDP, the reduce-scatter) under the load-balanced-experts assumption described in [Framework feature support](#framework-feature-support):
+
+- **Megatron** — [`tests/docker/megatron/moe/run_moe_tiny.sh`](tests/docker/megatron/moe/run_moe_tiny.sh) (tiny Mixtral-style, 8 experts / top-2; run with `--expert_model_parallel_size ≥ 2`) and [`run_gpt_oss_20b.sh`](tests/docker/megatron/moe/run_gpt_oss_20b.sh) (a gpt-oss-20b-shaped throughput proxy).
+- **DeepSpeed** — `--model deepspeed_moe` (expert-parallel all-to-all) and [`tests/docker/deepspeed/gpt_oss/run_gpt_oss_tiny.sh`](tests/docker/deepspeed/gpt_oss/run_gpt_oss_tiny.sh) (the real Hugging Face gpt-oss model).
+- **TorchTitan** — [`tests/test_torchtitan_qwen3_moe.toml`](tests/test_torchtitan_qwen3_moe.toml) (qwen3 MoE with `expert_parallel_degree > 1`); pass it via `./run.sh --job.config_file=tests/test_torchtitan_qwen3_moe.toml --training.debug_moe_force_load_balance`.
 
 ## Adapt your training scripts
 
