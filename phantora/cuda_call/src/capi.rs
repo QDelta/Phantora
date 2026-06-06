@@ -389,15 +389,15 @@ pub extern "C" fn cuda_event_query(
     id: i32,
     time_ref: *mut ffi::c_long,
 ) -> i32 {
+    // The simulator fast-forwards virtual time to the event's completion (like a
+    // synchronize) and replies with that time; adopt it as the local clock and
+    // report the event complete. This terminates CPU poll loops that would
+    // otherwise spin forever (virtual time can't advance during a pure poll).
     let resp =
         send_cuda_call_get_response(CudaCall::CudaEventQuery(CudaEvent { device, stream, id }));
-    match bincode::deserialize::<Option<i64>>(&resp).unwrap() {
-        None => 0,
-        Some(time) => {
-            unsafe { *time_ref = time };
-            1
-        }
-    }
+    let end_time = handle_sync_response(resp);
+    unsafe { *time_ref = end_time };
+    1
 }
 
 #[no_mangle]
@@ -410,9 +410,13 @@ pub extern "C" fn cuda_add_latency(device: i32, stream: i32, latency: i64) {
 
 #[no_mangle]
 pub extern "C" fn cuda_stream_query(device: i32, stream: i32) -> i32 {
+    // See cuda_event_query: the simulator fast-forwards to the stream's last event
+    // and replies with the completion time; adopt it and report complete so CPU
+    // poll loops terminate instead of spinning on a clock that can't advance.
     let resp =
         send_cuda_call_get_response(CudaCall::CudaStreamQuery(CudaStream { device, id: stream }));
-    bincode::deserialize::<bool>(&resp).unwrap() as i32
+    handle_sync_response(resp);
+    1
 }
 
 // #[repr(C)]

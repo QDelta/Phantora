@@ -105,6 +105,7 @@ def build_gpt_oss(args: argparse.Namespace) -> nn.Module:
     top-4 — set those via args on a machine with enough memory).
     """
     from transformers import GptOssConfig, GptOssForCausalLM
+    from transformers.modeling_utils import no_init_weights
 
     install_phantora_gpt_oss_patches()
     config = GptOssConfig(
@@ -126,7 +127,13 @@ def build_gpt_oss(args: argparse.Namespace) -> nn.Module:
     dtype_orig = torch.get_default_dtype()
     torch.set_default_dtype(torch.bfloat16)
     try:
-        model = GptOssForCausalLM(config)
+        # Under Phantora, kernels never execute and tensor values are garbage,
+        # so HF's per-parameter weight initialization (_init_weights) is pure
+        # wasted CPU work -- for gpt-oss-20b it dominates startup (~10 min for
+        # the 21B model, 8 ranks contending). Skip it; the simulated forward is
+        # value-independent anyway.
+        with no_init_weights():
+            model = GptOssForCausalLM(config)
     finally:
         torch.set_default_dtype(dtype_orig)
     return model
