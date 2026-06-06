@@ -36,9 +36,9 @@ Ready-to-run presets ship for each framework. `✅` links to the preset — a la
 | **MoE** | | | |
 | Mixtral 8×7B | [✅](tests/docker/megatron/moe/run_mixtral_8x7b.sh) | — | — |
 | gpt-oss 20B | — | [✅](tests/docker/deepspeed/gpt_oss/run_gpt_oss_20b.sh) | — |
-| Qwen3 MoE | — | — | [✅](tests/test_torchtitan_qwen3_moe.toml) ¹ |
+| Qwen3 30B-A3B | — | — | [✅](tests/test_torchtitan_qwen3_moe.toml) ¹ |
 
-1. Run with `--training.debug_moe_force_load_balance`, e.g. `./run.sh --job.config_file=tests/test_torchtitan_qwen3_moe.toml --training.debug_moe_force_load_balance`.
+1. Run with `--training.debug_moe_force_load_balance`. The full 30B-A3B flavor targets a real multi-GPU cluster; for a quick check on a modest box, add `--model.flavor=debugmodel_moe`.
 
 See [Try our examples](#try-our-examples) for how to launch one.
 

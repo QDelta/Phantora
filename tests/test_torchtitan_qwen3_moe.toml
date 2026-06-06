@@ -1,7 +1,9 @@
-# Qwen3 MoE on TorchTitan (>= 0.2.0). debugmodel_moe is a tiny MoE flavor; the real
-# ones are 30B-A3B / 235B-A22B. expert_parallel_degree > 1 exercises TorchTitan's
-# expert all-to-all. hf_assets_path points at any HF tokenizer dir (vocab only
-# matters for embedding dims under Phantora's payload-free sim).
+# Qwen3 30B-A3B MoE on TorchTitan (>= 0.2.0): 48 layers, 128 experts, top-8.
+# expert_parallel_degree > 1 exercises TorchTitan's expert all-to-all. For a quick
+# check on a modest box, override the flavor: --model.flavor=debugmodel_moe. The
+# full flavor wants a real multi-GPU cluster (config_gen --ngpu/--vram_mib).
+# hf_assets_path points at any HF tokenizer dir (only its vocab size matters for
+# embedding dims under Phantora's payload-free sim).
 [job]
 dump_folder = "trace"
 description = "Qwen3 MoE training"
@@ -15,7 +17,7 @@ enable_tensorboard = false
 
 [model]
 name = "qwen3"
-flavor = "debugmodel_moe"
+flavor = "30B-A3B"
 hf_assets_path = "tests/assets/hf_tokenizer"
 
 [optimizer]
