@@ -34,14 +34,13 @@ Ready-to-run presets ship for each framework. `✅` links to the preset — a la
 | Llama3 8B | [✅](tests/docker/megatron/llama/run_llama3_8b.sh) | [✅](tests/docker/deepspeed/llama/run_llama3_8b.sh) | [✅](tests/docker/torchtitan/llama3/run_llama3_8b.sh) ¹ |
 | Llama3 70B | [✅](tests/docker/megatron/llama/run_llama3_70b.sh) | [✅](tests/docker/deepspeed/llama/run_llama3_70b.sh) | — |
 | **MoE** | | | |
-| Mixtral 8×7B | [✅](tests/docker/megatron/moe/run_mixtral_8x7b.sh) ² | — | — |
-| gpt-oss | [✅](tests/docker/megatron/moe/run_gpt_oss_20b.sh) ³ | [✅](tests/docker/deepspeed/gpt_oss/run_gpt_oss_tiny.sh) | — |
-| Qwen3 MoE | — | — | [✅](tests/test_torchtitan_qwen3_moe.toml) ⁴ |
+| Mixtral 8×7B | [✅](tests/docker/megatron/moe/run_mixtral_8x7b.sh) | — | — |
+| gpt-oss | [✅](tests/docker/megatron/moe/run_gpt_oss_20b.sh) ² | [✅](tests/docker/deepspeed/gpt_oss/run_gpt_oss_tiny.sh) | — |
+| Qwen3 MoE | — | — | [✅](tests/test_torchtitan_qwen3_moe.toml) ³ |
 
 1. TorchTitan Llama3 8B also has a pipeline-parallel variant, [`test_torchtitan_llama3_8b_pp.toml`](tests/test_torchtitan_llama3_8b_pp.toml).
-2. The real Mixtral architecture — Megatron-core's MoE GPTModel *is* GQA + RoPE + top-2-of-8 SwiGLU experts. For a quick check, scale it down with `--num_layers` / `--hidden_size` overrides.
-3. Megatron builds from its own `GPTModel`, so this matches gpt-oss-20b's *dimensions* as a throughput proxy, not the exact architecture (no attention sinks / clamped gating). DeepSpeed's gpt-oss is the real Hugging Face model.
-4. Run with `--training.debug_moe_force_load_balance`, e.g. `./run.sh --job.config_file=tests/test_torchtitan_qwen3_moe.toml --training.debug_moe_force_load_balance`.
+2. Megatron builds from its own `GPTModel`, so this matches gpt-oss-20b's *dimensions* as a throughput proxy, not the exact architecture (no attention sinks / clamped gating). DeepSpeed's gpt-oss is the real Hugging Face model.
+3. Run with `--training.debug_moe_force_load_balance`, e.g. `./run.sh --job.config_file=tests/test_torchtitan_qwen3_moe.toml --training.debug_moe_force_load_balance`.
 
 See [Try our examples](#try-our-examples) for how to launch one.
 
