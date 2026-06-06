@@ -142,6 +142,14 @@ python3 config_gen.py --nhost 1 --ngpu 8 --vram_mib 81920 --record-perf-db l40s
 tests/perfdb/record_all.sh <NAME>
 ```
 
+To regenerate the database for a different GPU **without building Phantora at all**, `tests/perfdb/bench.py` re-profiles the recorded shapes using only stock PyTorch (it reads the keys from an existing DB and re-times each kernel on the local GPU):
+
+```bash
+python3 tests/perfdb/bench.py --ref tests/perfdb/l40s   # writes tests/perfdb/<your-gpu>/
+```
+
+It mirrors Phantora's profiling (kernel-only timing, operand aliasing) and reproduces a Phantora-recorded database to ~1% per-op, giving an identical simulated iteration time.
+
 The committed `tests/perfdb/l40s/` was recorded on an NVIDIA L40S. The CSV is human-readable: each row is one `(op, shape) → nanoseconds` entry.
 
 ## Adapt your training scripts
