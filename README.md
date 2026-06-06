@@ -34,15 +34,16 @@ Ready-to-run presets ship for each framework. `✅` links to the preset — a la
 | Llama3 8B | [✅](tests/docker/megatron/llama/run_llama3_8b.sh) | [✅](tests/docker/deepspeed/llama/run_llama3_8b.sh) | [✅](tests/docker/torchtitan/llama3/run_llama3_8b.sh) ¹ |
 | Llama3 70B | [✅](tests/docker/megatron/llama/run_llama3_70b.sh) | [✅](tests/docker/deepspeed/llama/run_llama3_70b.sh) | — |
 | **MoE** | | | |
-| Mixtral-style (tiny) | [✅](tests/docker/megatron/moe/run_moe_tiny.sh) | — | — |
-| Expert-parallel MoE (synthetic) | — | ✅ ² | — |
-| gpt-oss | [✅](tests/docker/megatron/moe/run_gpt_oss_20b.sh) ³ | [✅](tests/docker/deepspeed/gpt_oss/run_gpt_oss_tiny.sh) | — |
-| Qwen3 MoE | — | — | [✅](tests/test_torchtitan_qwen3_moe.toml) ⁴ |
+| Mixtral 8×7B | [✅](tests/docker/megatron/moe/run_mixtral_8x7b.sh) ² | — | — |
+| Expert-parallel MoE (synthetic) | — | ✅ ³ | — |
+| gpt-oss | [✅](tests/docker/megatron/moe/run_gpt_oss_20b.sh) ⁴ | [✅](tests/docker/deepspeed/gpt_oss/run_gpt_oss_tiny.sh) | — |
+| Qwen3 MoE | — | — | [✅](tests/test_torchtitan_qwen3_moe.toml) ⁵ |
 
 1. TorchTitan Llama3 8B also has a pipeline-parallel variant, [`test_torchtitan_llama3_8b_pp.toml`](tests/test_torchtitan_llama3_8b_pp.toml).
-2. DeepSpeed's expert-parallel all-to-all is exercised by a small synthetic MoE stack via `--model deepspeed_moe` (no dedicated launcher; experts are `Linear-GELU-Linear`).
-3. Megatron builds from its own `GPTModel`, so this matches gpt-oss-20b's *dimensions* as a throughput proxy, not the exact architecture (no attention sinks / clamped gating). DeepSpeed's gpt-oss is the real Hugging Face model.
-4. Run with `--training.debug_moe_force_load_balance`, e.g. `./run.sh --job.config_file=tests/test_torchtitan_qwen3_moe.toml --training.debug_moe_force_load_balance`.
+2. The real Mixtral architecture — Megatron-core's MoE GPTModel *is* GQA + RoPE + top-2-of-8 SwiGLU experts. A tiny smoke-test variant ([`run_moe_tiny.sh`](tests/docker/megatron/moe/run_moe_tiny.sh)) builds fast for quick checks.
+3. DeepSpeed's expert-parallel all-to-all is exercised by a small synthetic MoE stack via `--model deepspeed_moe` (no dedicated launcher; experts are `Linear-GELU-Linear`).
+4. Megatron builds from its own `GPTModel`, so this matches gpt-oss-20b's *dimensions* as a throughput proxy, not the exact architecture (no attention sinks / clamped gating). DeepSpeed's gpt-oss is the real Hugging Face model.
+5. Run with `--training.debug_moe_force_load_balance`, e.g. `./run.sh --job.config_file=tests/test_torchtitan_qwen3_moe.toml --training.debug_moe_force_load_balance`.
 
 See [Try our examples](#try-our-examples) for how to launch one.
 
