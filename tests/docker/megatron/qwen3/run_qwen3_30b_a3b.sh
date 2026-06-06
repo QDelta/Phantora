@@ -10,7 +10,7 @@
 # ~30.5B total / ~3.3B active. Needs expert (and typically tensor/pipeline)
 # parallelism plus recompute to fit; pass parallelism via $@, e.g.:
 #   python3 config_gen.py --nhost 8 --ngpu 8 --vram_mib 81920
-#   ./moe/run_qwen3_30b_a3b.sh --expert_model_parallel_size 8 --tensor_parallel_size 4 \
+#   ./qwen3/run_qwen3_30b_a3b.sh --expert_model_parallel_size 8 --tensor_parallel_size 4 \
 #       --pipeline_model_parallel_size 2 --recompute_activations --sequence_length 4096
 
 WORKDIR=$(dirname "$(realpath "$0")")

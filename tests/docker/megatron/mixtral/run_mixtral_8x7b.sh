@@ -10,7 +10,7 @@
 # ~46.7B total / ~12.9B active. Needs expert (and typically tensor/pipeline)
 # parallelism plus recompute to fit; pass parallelism via $@, e.g.:
 #   python3 config_gen.py --nhost 4 --ngpu 8 --vram_mib 81920
-#   ./moe/run_mixtral_8x7b.sh --expert_model_parallel_size 8 --tensor_parallel_size 4 \
+#   ./mixtral/run_mixtral_8x7b.sh --expert_model_parallel_size 8 --tensor_parallel_size 4 \
 #       --pipeline_model_parallel_size 1 --recompute_activations --sequence_length 4096
 
 WORKDIR=$(dirname "$(realpath "$0")")

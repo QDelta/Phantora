@@ -34,9 +34,9 @@ Ready-to-run presets ship for each framework. `✅` links to the preset — a la
 | Llama3 8B | [✅](tests/docker/megatron/llama/run_llama3_8b.sh) | [✅](tests/docker/deepspeed/llama/run_llama3_8b.sh) | [✅](tests/docker/torchtitan/llama3/run_llama3_8b.sh) |
 | Llama3 70B | [✅](tests/docker/megatron/llama/run_llama3_70b.sh) | [✅](tests/docker/deepspeed/llama/run_llama3_70b.sh) | — |
 | **MoE** | | | |
-| Mixtral 8×7B | [✅](tests/docker/megatron/moe/run_mixtral_8x7b.sh) | — | — |
+| Mixtral 8×7B | [✅](tests/docker/megatron/mixtral/run_mixtral_8x7b.sh) | — | — |
 | gpt-oss 20B | — | [✅](tests/docker/deepspeed/gpt_oss/run_gpt_oss_20b.sh) | — |
-| Qwen3 30B-A3B | [✅](tests/docker/megatron/moe/run_qwen3_30b_a3b.sh) | — | [✅](tests/test_torchtitan_qwen3_moe.toml) ¹ |
+| Qwen3 30B-A3B | [✅](tests/docker/megatron/qwen3/run_qwen3_30b_a3b.sh) | — | [✅](tests/test_torchtitan_qwen3_moe.toml) ¹ |
 
 1. TorchTitan flavors are fixed-size; run with `--training.debug_moe_force_load_balance`. The full 30B-A3B flavor targets a real multi-GPU cluster; for a quick check on a modest box, add `--model.flavor=debugmodel_moe`.
 
