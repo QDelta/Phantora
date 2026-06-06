@@ -264,6 +264,29 @@ def install_phantora_torchtitan_moe_patches() -> None:
     except (ImportError, AttributeError):
         pass
 
+    # Disable flex attention on every registered model flavor. TorchTitan's
+    # FlexAttentionWrapper is a torch.compile(mode="max-autotune") flex_attention
+    # -> triton kernels the Phantora stub can't load; and the block_causal path
+    # builds a document mask (get_document_mask_mod) that does data-dependent
+    # indexing on token values (e.g. eos positions). Forcing use_flex_attn=False
+    # selects the standard causal SDPA path (which Phantora simulates), and
+    # train.py then skips get_attention_masks entirely. model_args entries are
+    # shared module-level instances, so mutating them here (before the model is
+    # built) is picked up by the Trainer.
+    try:
+        from torchtitan.models import _supported_models
+        from torchtitan.protocols.train_spec import get_train_spec
+        for _name in _supported_models:
+            try:
+                spec = get_train_spec(_name)
+            except Exception:
+                continue
+            for _ma in spec.model_args.values():
+                if hasattr(_ma, "use_flex_attn"):
+                    _ma.use_flex_attn = False
+    except (ImportError, AttributeError):
+        pass
+
     # Round-up helper (matches torchtitan.tools.utils._round_up) without importing
     # so the shim works regardless of internal moves.
     def _round_up(x, m):
