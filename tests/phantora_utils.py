@@ -116,9 +116,16 @@ def install_phantora_deepspeed_patches() -> None:
     get_phantora_metadata_process_group()
 
     def _positive_norm(norm):
-        if torch.is_tensor(norm):
-            return torch.where(norm > 0, norm, torch.ones_like(norm))
-        return norm if norm > 0 else 1.0
+        # Under payload-free simulation the gradient norm is garbage (commonly
+        # exactly 0). torch.where/clamp can't fix it -- they run as no-op CUDA
+        # kernels that don't execute, so they return garbage too. Read the value
+        # on the host and substitute a positive scalar when it is non-positive or
+        # non-finite, so DeepSpeed's `assert norm > 0` holds. The magnitude is
+        # meaningless here and gradient clipping is disabled, so it doesn't matter.
+        value = norm.item() if torch.is_tensor(norm) else float(norm)
+        if value > 0.0 and value not in (float("inf"), float("-inf")):
+            return norm
+        return 1.0
 
     if not getattr(ds_bf16.get_global_norm_of_tensors, "_phantora_positive_norm", False):
         # Patch target: deepspeed.runtime.bf16_optimizer.get_global_norm_of_tensors.

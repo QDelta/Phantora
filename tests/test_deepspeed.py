@@ -8,6 +8,7 @@ from phantora_utils import (
 )
 
 import argparse
+import copy
 import os
 
 import torch
@@ -25,14 +26,32 @@ from transformers import LlamaConfig, LlamaForCausalLM
 class LlamaDecoderLayerPipe(nn.Module):
     # DeepSpeed PipelineModule runs a sequence of layer callables. Keep the
     # original HF decoder layer and only adapt its PipelineModule I/O shape.
-    def __init__(self, layer: nn.Module):
+    #
+    # transformers >= 4.5x computes the rotary (cos, sin) once in
+    # LlamaModel.forward and passes it to every layer as position_embeddings;
+    # LlamaDecoderLayer no longer derives it from position_ids itself. The
+    # pipeline split bypasses LlamaModel.forward, so each stage carries its own
+    # rotary module and recomputes position_embeddings here (a per-layer copy
+    # keeps each pipeline stage self-contained across ranks).
+    def __init__(self, layer: nn.Module, rotary_emb: nn.Module):
         super().__init__()
         self.layer = layer
+        self.rotary_emb = rotary_emb
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         seq_len = hidden_states.shape[1]
         position_ids = torch.arange(seq_len, device=hidden_states.device).unsqueeze(0)
-        return self.layer(hidden_states, position_ids=position_ids, use_cache=False)[0]
+        position_embeddings = self.rotary_emb(hidden_states, position_ids)
+        out = self.layer(
+            hidden_states,
+            position_ids=position_ids,
+            position_embeddings=position_embeddings,
+            use_cache=False,
+        )
+        # transformers 4.56's LlamaDecoderLayer.forward returns the hidden-states
+        # tensor directly; older versions returned a 1-tuple. Indexing [0] on the
+        # new tensor would slice off the batch dim, so unpack only when needed.
+        return out[0] if isinstance(out, tuple) else out
 
 
 def causal_lm_loss(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
@@ -57,7 +76,11 @@ def build_pipeline_model(args: argparse.Namespace) -> PipelineModule:
         max_position_embeddings=args.sequence_length,
         rope_theta=args.rope_theta,
         use_cache=False,
-        attn_implementation="flash_attention_2",
+        # eager (not flash_attention_2): flash-attn derives seqlens from tensor
+        # values (e.g. cu_seqlens via .max()), which are garbage under Phantora's
+        # payload-free sim and overflow the kernel-time estimator. Attention is
+        # simulated either way, so eager is equivalent here (matches gpt-oss).
+        attn_implementation="eager",
     )
 
     dtype_orig = torch.get_default_dtype()
@@ -74,7 +97,10 @@ def build_pipeline_model(args: argparse.Namespace) -> PipelineModule:
         )
     layers = [
         llama.model.embed_tokens,
-        *(LlamaDecoderLayerPipe(layer) for layer in llama.model.layers),
+        *(
+            LlamaDecoderLayerPipe(layer, copy.deepcopy(llama.model.rotary_emb))
+            for layer in llama.model.layers
+        ),
         llama.model.norm,
         llama.lm_head,
     ]
