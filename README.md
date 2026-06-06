@@ -122,7 +122,7 @@ TorchTitan (≥ 0.2.0) loads a Hugging Face tokenizer **directory** (`tokenizer.
 
 Phantora normally needs one GPU to *profile* each kernel's time. For the model presets, those timings can be **recorded once and replayed**, so the presets can be simulated on a machine with no GPU.
 
-A preset produces a fixed, enumerable set of kernel shapes, so a recorded **performance database** (`tests/perfdb/<gpu>/`, plain CSV) is complete for it. The simulator then answers timing queries from the database instead of touching the GPU.
+A preset produces a fixed, enumerable set of kernel shapes, so a recorded **performance database** (`tests/perfdb/<gpu>/`, plain CSV) is complete for it. The simulator then answers timing queries from the database instead of touching the GPU. In replay the whole stack runs with **no GPU and no NVIDIA driver** — only the CUDA libraries bundled in the Phantora image are present (and never called); verified by replaying every preset in containers with no driver injected.
 
 ```bash
 # Replay on a GPU-less machine (uses the committed database; --perf-db drops the
