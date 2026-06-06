@@ -9,7 +9,7 @@ install_phantora_torchtitan_patches()
 
 import torch
 from torchtitan.tools.logging import init_logger
-from torchtitan.config_manager import ConfigManager
+from torchtitan.config import ConfigManager  # torchtitan >= 0.2.0 (was torchtitan.config_manager)
 from torchtitan.train import Trainer
 
 if __name__ == '__main__':

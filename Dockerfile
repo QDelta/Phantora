@@ -53,7 +53,10 @@ RUN curl -Lo torchtitan-requirements.txt https://raw.githubusercontent.com/pytor
 # transformers 4.56.2 (>= needed for gpt-oss MoE) dropped its numpy<2 cap; pin
 # numpy==1.26.4 so it isn't dragged to 2.x, which is ABI-incompatible with the
 # from-source torch build and would trigger a full PyTorch recompile here.
-RUN python3 -m pip install --no-cache-dir megatron-core==0.13.1 transformers==4.56.2 deepspeed==0.17.5 torchtitan==0.1.0 numpy==1.26.4
+# torchtitan 0.2.0 adds MoE models (deepseek_v3/llama4/qwen3); it needs triton
+# (not pulled in automatically) and works on torch 2.9.1 (0.2.1+ require a torch
+# 2.10 attention API). The v0.1.0 CI requirements above remain sufficient.
+RUN python3 -m pip install --no-cache-dir megatron-core==0.13.1 transformers==4.56.2 deepspeed==0.17.5 torchtitan==0.2.0 numpy==1.26.4 triton==3.7.0
 
 # DeepSpeed needs passwordless ssh
 COPY config/sshconfig /root/.ssh/config
