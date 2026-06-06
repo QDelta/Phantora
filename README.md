@@ -37,10 +37,8 @@ Ready-to-run presets ship for each framework. `✅` links to the preset — a la
 | Mixtral 8×7B | [✅](tests/docker/megatron/moe/run_mixtral_8x7b.sh) | — | — |
 | gpt-oss 20B | — | [✅](tests/docker/deepspeed/gpt_oss/run_gpt_oss_20b.sh) | — |
 | Qwen3 30B-A3B | [✅](tests/docker/megatron/moe/run_qwen3_30b_a3b.sh) | — | [✅](tests/test_torchtitan_qwen3_moe.toml) ¹ |
-| DeepSeek-V3 671B | — | — | [✅](tests/test_torchtitan_deepseek_v3.toml) ¹ ² |
 
-1. TorchTitan flavors are fixed-size; run with `--training.debug_moe_force_load_balance`, and for a quick check on a modest box override the flavor (`--model.flavor=debugmodel_moe` for Qwen3, `--model.flavor=debugmodel` for DeepSeek-V3).
-2. DeepSeek-V3 has **shared experts** (always active, dense) plus routed experts. The shared experts are a plain FFN over all tokens — no routing, no all-to-all — so they need no special handling under simulation; only the routed experts use the load-balanced dispatch shim.
+1. TorchTitan flavors are fixed-size; run with `--training.debug_moe_force_load_balance`. The full 30B-A3B flavor targets a real multi-GPU cluster; for a quick check on a modest box, add `--model.flavor=debugmodel_moe`.
 
 See [Try our examples](#try-our-examples) for how to launch one.
 
