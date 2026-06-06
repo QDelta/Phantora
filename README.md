@@ -35,7 +35,7 @@ Ready-to-run presets ship for each framework. `✅` links to the preset — a la
 | Llama3 70B | [✅](tests/docker/megatron/llama/run_llama3_70b.sh) | [✅](tests/docker/deepspeed/llama/run_llama3_70b.sh) | — |
 | **MoE** | | | |
 | Mixtral 8×7B | [✅](tests/docker/megatron/moe/run_mixtral_8x7b.sh) | — | — |
-| gpt-oss | — | [✅](tests/docker/deepspeed/gpt_oss/run_gpt_oss_tiny.sh) | — |
+| gpt-oss 20B | — | [✅](tests/docker/deepspeed/gpt_oss/run_gpt_oss_20b.sh) | — |
 | Qwen3 MoE | — | — | [✅](tests/test_torchtitan_qwen3_moe.toml) ¹ |
 
 1. Run with `--training.debug_moe_force_load_balance`, e.g. `./run.sh --job.config_file=tests/test_torchtitan_qwen3_moe.toml --training.debug_moe_force_load_balance`.
