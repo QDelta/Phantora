@@ -53,9 +53,11 @@ pub struct TorchEstimator {
     tensor_cache: LruCache<(i64, Kind), Tensor>,
     compute_cache: HashMap<TorchCallInfo, Duration>,
     sequence_cache: BTreeMap<u64, Vec<Duration>>,
-    // perf-db replay: answer only from the preloaded caches; a miss is a hard
-    // error instead of a GPU profile (no GPU is available).
+    // perf-db replay: answer only from the preloaded caches (no GPU). A miss is
+    // recorded here (discovery) and substituted with a zero placeholder so the
+    // run completes and the full set of unrecorded shapes can be reported.
     replay: bool,
+    missing: Vec<TorchCallInfo>,
 }
 
 impl TorchEstimator {
@@ -68,6 +70,7 @@ impl TorchEstimator {
             compute_cache: HashMap::new(),
             sequence_cache: BTreeMap::new(),
             replay: false,
+            missing: Vec::new(),
         }
     }
 
@@ -82,11 +85,17 @@ impl TorchEstimator {
             compute_cache,
             sequence_cache,
             replay: true,
+            missing: Vec::new(),
         }
     }
 
     pub fn compute_cache(&self) -> &HashMap<TorchCallInfo, Duration> {
         &self.compute_cache
+    }
+
+    /// Compute keys requested during replay that were not in the DB (discovery).
+    pub fn missing(&self) -> &[TorchCallInfo] {
+        &self.missing
     }
 
     pub fn sequence_cache(&self) -> &BTreeMap<u64, Vec<Duration>> {
@@ -575,10 +584,10 @@ impl TorchEstimator {
         if let Some(value) = self.compute_cache.get(call) {
             *value
         } else if self.replay {
-            panic!(
-                "perf-db replay: missing timing for {call} ({call:?}); \
-                 re-record the DB on a GPU for this config"
-            );
+            // Discovery: record the unrecorded shape and substitute a zero
+            // placeholder so the run finishes and reports every missing shape.
+            self.missing.push(call.clone());
+            Duration::ZERO
         } else {
             let duration = self.run(2, call);
             self.compute_cache.insert(call.clone(), duration);
@@ -599,11 +608,9 @@ impl TorchEstimator {
             return value.clone();
         }
         if self.replay {
-            let ops: Vec<String> = calls.iter().map(|c| c.info.to_string()).collect();
-            panic!(
-                "perf-db replay: missing sequence timing (hash {seq_hash}) for ops {ops:?}; \
-                 re-record the DB on a GPU for this config"
-            );
+            // perf-db forces single-op timing, so sequences aren't used in
+            // replay; if one slips through, fall back to per-op discovery.
+            return calls.iter().map(|c| self.estimate(&c.info)).collect();
         }
         let mut durs = Vec::new();
         for call in calls {

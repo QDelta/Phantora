@@ -1696,5 +1696,62 @@ impl Simulator {
                 Err(e) => log::error!("perf-db record: failed to write {}: {e}", dir.display()),
             }
         }
+
+        // In replay mode, report any shapes that weren't in the DB (discovery).
+        // Write them to `<db>.missing/` so they can be profiled on a GPU with
+        // bench.py and merged/contributed back. A run with no misses clears any
+        // stale manifest. The reported numbers are INVALID when misses occurred
+        // (unrecorded ops were charged zero time).
+        if let Some(dir) = &args::get_args().perf_db {
+            let missing_path =
+                std::path::PathBuf::from(format!("{}.missing", dir.display()));
+            let compute: HashMap<_, _> = self
+                .torch_estimator
+                .missing()
+                .iter()
+                .map(|k| (k.clone(), Duration::ZERO))
+                .collect();
+            let memcpy: HashMap<_, _> = self
+                .cuda_estimator
+                .missing_memcpy()
+                .iter()
+                .map(|&k| (k, Duration::ZERO))
+                .collect();
+            let flash_attn: HashMap<_, _> = self
+                .cuda_estimator
+                .missing_flash()
+                .iter()
+                .map(|k| (k.clone(), Duration::ZERO))
+                .collect();
+            if compute.is_empty() && memcpy.is_empty() && flash_attn.is_empty() {
+                let _ = std::fs::remove_dir_all(&missing_path);
+            } else {
+                let db = PerfDb {
+                    gpu_name: String::new(),
+                    compute,
+                    sequence: Default::default(),
+                    memcpy,
+                    flash_attn,
+                };
+                match db.save(&missing_path) {
+                    Ok(()) => log::warn!(
+                        "perf-db replay: {} compute / {} memcpy / {} flash_attn shape(s) were NOT \
+                         in the database -- the simulated numbers from this run are INVALID. Wrote \
+                         the missing shapes to {m}. To complete the DB, profile them on a GPU with \
+                         `python3 tests/perfdb/bench.py --ref {m} --out {d} --merge` and re-run \
+                         (and consider contributing the result back).",
+                        db.compute.len(),
+                        db.memcpy.len(),
+                        db.flash_attn.len(),
+                        m = missing_path.display(),
+                        d = dir.display(),
+                    ),
+                    Err(e) => log::error!(
+                        "perf-db replay: failed to write missing manifest {}: {e}",
+                        missing_path.display()
+                    ),
+                }
+            }
+        }
     }
 }

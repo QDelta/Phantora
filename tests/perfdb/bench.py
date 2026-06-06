@@ -234,6 +234,9 @@ def main():
     ap.add_argument("--iters", type=int, default=5)
     ap.add_argument("--wall", action="store_true",
                     help="use CUDA-event wall time instead of kernel-only (default) timing")
+    ap.add_argument("--merge", action="store_true",
+                    help="merge profiled keys into an existing --out DB (e.g. to fill a "
+                         "<db>.missing manifest into <db>) instead of overwriting it")
     args = ap.parse_args()
     timer = time_wall if args.wall else time_kernel
 
@@ -244,16 +247,28 @@ def main():
     os.makedirs(out, exist_ok=True)
     print(f"GPU: {gpu}\nref: {args.ref}\nout: {out}")
 
-    # compute.csv
+    def load_existing(path, nkey):
+        """Load an existing CSV into {tuple(first nkey cols): full row}."""
+        rows = {}
+        if os.path.exists(path):
+            with open(path) as f:
+                rd = csv.reader(f)
+                next(rd, None)
+                for row in rd:
+                    if row:
+                        rows[tuple(row[:nkey])] = row
+        return rows
+
+    # compute.csv (key columns: op, key). With --merge, start from the existing
+    # out DB and overlay the profiled keys; otherwise write a fresh table.
+    compute_out = os.path.join(out, "compute.csv")
+    rows = load_existing(compute_out, 2) if args.merge else {}
     n_ok = n_skip = 0
-    with open(os.path.join(args.ref, "compute.csv")) as f, \
-         open(os.path.join(out, "compute.csv"), "w", newline="") as g:
-        r = csv.reader(f); w = csv.writer(g)
-        w.writerow(next(r))  # header
+    with open(os.path.join(args.ref, "compute.csv")) as f:
+        r = csv.reader(f); next(r)
         for op, key, ref_nanos in r:
             try:
-                payload = json.loads(key)[op]
-                thunk = build(op, payload)
+                thunk = build(op, json.loads(key)[op])
                 if thunk is None:
                     raise NotImplementedError(op)
                 nanos = timer(thunk, args.warmup, args.iters)
@@ -262,15 +277,19 @@ def main():
                 nanos = int(ref_nanos)
                 n_skip += 1
                 print(f"  WARN {op}: {type(e).__name__}: {str(e)[:80]} -> kept reference time", file=sys.stderr)
-            w.writerow([op, key, nanos])
-    print(f"compute.csv: {n_ok} profiled, {n_skip} carried-over")
+            rows[(op, key)] = [op, key, nanos]
+    with open(compute_out, "w", newline="") as g:
+        w = csv.writer(g); w.writerow(["op", "key", "nanos"])
+        for row in sorted(rows.values()):
+            w.writerow(row)
+    print(f"compute.csv: {n_ok} profiled, {n_skip} carried-over, {len(rows)} total")
 
-    # memcpy.csv
+    # memcpy.csv (key columns: kind, size_bytes)
+    memcpy_out = os.path.join(out, "memcpy.csv")
+    mrows = load_existing(memcpy_out, 2) if args.merge else {}
     m_ok = 0
-    with open(os.path.join(args.ref, "memcpy.csv")) as f, \
-         open(os.path.join(out, "memcpy.csv"), "w", newline="") as g:
-        r = csv.reader(f); w = csv.writer(g)
-        w.writerow(next(r))
+    with open(os.path.join(args.ref, "memcpy.csv")) as f:
+        r = csv.reader(f); next(r)
         for kind, size, ref_nanos in r:
             try:
                 nanos = timer(memcpy_thunk(kind, int(size)), args.warmup, args.iters)
@@ -278,15 +297,21 @@ def main():
             except Exception as e:
                 nanos = int(ref_nanos)
                 print(f"  WARN memcpy {kind}/{size}: {e}", file=sys.stderr)
-            w.writerow([kind, size, nanos])
-    print(f"memcpy.csv: {m_ok} profiled")
+            mrows[(kind, size)] = [kind, size, nanos]
+    with open(memcpy_out, "w", newline="") as g:
+        w = csv.writer(g); w.writerow(["kind", "size_bytes", "nanos"])
+        for row in sorted(mrows.values(), key=lambda x: (x[0], int(x[1]))):
+            w.writerow(row)
+    print(f"memcpy.csv: {m_ok} profiled, {len(mrows)} total")
 
-    # sequence/flash_attn: empty under single-op timing; copy headers from ref.
-    for name in ("sequence.csv", "flash_attn.csv"):
-        src = os.path.join(args.ref, name)
-        if os.path.exists(src):
-            with open(src) as f, open(os.path.join(out, name), "w") as g:
-                g.write(f.read())
+    # sequence/flash_attn: empty under single-op timing. Copy from ref only for a
+    # fresh DB; when merging, leave the existing DB's tables untouched.
+    if not args.merge:
+        for name in ("sequence.csv", "flash_attn.csv"):
+            src = os.path.join(args.ref, name)
+            if os.path.exists(src):
+                with open(src) as f, open(os.path.join(out, name), "w") as g:
+                    g.write(f.read())
 
     with open(os.path.join(out, "manifest.md"), "w") as f:
         f.write(f"# Phantora performance database\n\n- **GPU:** {gpu}\n- **Schema version:** 1\n"

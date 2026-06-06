@@ -73,10 +73,14 @@ pub struct CudaEstimator {
     flash_attn_cache: HashMap<FlashAttnKey, Duration>,
 
     // GPU handles. `None` in perf-db replay mode (no GPU): timings come from the
-    // preloaded caches and a miss is a hard error rather than a GPU profile.
+    // preloaded caches; a miss is recorded below (discovery) and replaced with a
+    // zero placeholder instead of profiling.
     torch: Option<Py<PyModule>>,
     flash_attn_cuda: Option<Py<PyModule>>,
     device: Option<PyObject>,
+
+    missing_memcpy: Vec<(CudaMemcpyKind, usize)>,
+    missing_flash: Vec<FlashAttnKey>,
 }
 
 fn replay_memcpy(kind: CudaMemcpyKind, size: usize) -> Duration {
@@ -261,6 +265,8 @@ impl CudaEstimator {
             torch: Some(torch),
             flash_attn_cuda: Some(flash_attn_cuda),
             device: Some(device),
+            missing_memcpy: Vec::new(),
+            missing_flash: Vec::new(),
         }
     }
 
@@ -276,11 +282,22 @@ impl CudaEstimator {
             torch: None,
             flash_attn_cuda: None,
             device: None,
+            missing_memcpy: Vec::new(),
+            missing_flash: Vec::new(),
         }
     }
 
     fn is_replay(&self) -> bool {
         self.torch.is_none()
+    }
+
+    /// memcpy/flash keys requested during replay that were not in the DB.
+    pub fn missing_memcpy(&self) -> &[(CudaMemcpyKind, usize)] {
+        &self.missing_memcpy
+    }
+
+    pub fn missing_flash(&self) -> &[FlashAttnKey] {
+        &self.missing_flash
     }
 
     pub fn memcpy_cache(&self) -> &HashMap<(CudaMemcpyKind, usize), Duration> {
@@ -321,10 +338,8 @@ impl CudaEstimator {
             return dur;
         }
         if self.is_replay() {
-            panic!(
-                "perf-db replay: missing memcpy timing for ({kind:?}, {size} bytes); \
-                 re-record the DB on a GPU for this config"
-            );
+            self.missing_memcpy.push((kind, size)); // discovery; zero placeholder
+            return Duration::ZERO;
         }
         let dur = replay_memcpy(kind, size);
         self.memcpy_cache.insert((kind, size), dur);
@@ -373,10 +388,8 @@ impl CudaEstimator {
             return dur;
         }
         if self.is_replay() {
-            panic!(
-                "perf-db replay: missing flash_attn timing for {key:?}; \
-                 re-record the DB on a GPU for this config"
-            );
+            self.missing_flash.push(key); // discovery; zero placeholder
+            return Duration::ZERO;
         }
         let dur = Python::with_gil(|py| {
             // Bind to owned PyObjects so no borrow of `self.torch` is held across

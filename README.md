@@ -120,37 +120,53 @@ TorchTitan (≥ 0.2.0) loads a Hugging Face tokenizer **directory** (`tokenizer.
 
 ## Run without a GPU (performance database)
 
-Phantora normally needs one GPU to *profile* each kernel's time. For the model presets, those timings can be **recorded once and replayed**, so the presets can be simulated on a machine with no GPU.
+Phantora normally needs one GPU to *profile* each kernel's time. For the model presets, those timings can be **recorded once and replayed**, so the presets can be simulated on a machine with **no GPU and no NVIDIA driver** — only the CUDA libraries bundled in the Phantora image are present (and never called in replay; verified by replaying every preset in containers with no driver injected).
 
-A preset produces a fixed, enumerable set of kernel shapes, so a recorded **performance database** (`tests/perfdb/<gpu>/`, plain CSV) is complete for it. The simulator then answers timing queries from the database instead of touching the GPU. In replay the whole stack runs with **no GPU and no NVIDIA driver** — only the CUDA libraries bundled in the Phantora image are present (and never called); verified by replaying every preset in containers with no driver injected.
+A preset produces a fixed, enumerable set of kernel shapes, so a recorded **performance database** (`tests/perfdb/<gpu>/`, plain CSV) is complete for it. In replay the simulator answers every timing query from the database instead of touching the GPU.
+
+### Replay a preset (no GPU)
+
+`--perf-db <name>` makes `config_gen.py` point the simulator at `tests/perfdb/<name>/` and **drop the simulator's GPU reservation**, so the whole stack runs GPU-free:
 
 ```bash
-# Replay on a GPU-less machine (uses the committed database; --perf-db drops the
-# simulator's GPU reservation, so no GPU is required):
 cd tests/docker/megatron
 python3 config_gen.py --nhost 1 --ngpu 8 --vram_mib 81920 --perf-db l40s
 ./run.sh ./mixtral/run_mixtral_8x7b.sh --expert_model_parallel_size 8
 ```
 
-The database is **specific to the GPU it was recorded on and to the run config** (parallelism, sequence length, micro-batch). `num_layers` does *not* matter — layers repeat identical shapes — so a database recorded at 4 layers serves the full-depth preset at the same config. If a run needs a shape that isn't in the database, the simulator stops with a clear error naming the missing op; record it (or your own GPU/config) with:
+The committed `tests/perfdb/l40s/` (recorded on an NVIDIA L40S) covers all presets. The CSV is human-readable — each row is one `(op, shape) → nanoseconds` entry.
+
+A database is **specific to the GPU and to the run config** (parallelism, sequence length, micro-batch) — but **not** to `num_layers` (layers repeat identical shapes), so a database recorded at 4 layers serves the full-depth preset at the same config.
+
+### Changing the config (e.g. a larger context window)
+
+If you change a parameter that introduces new kernel shapes — say a bigger `--sequence_length` — the database won't have them. Phantora doesn't crash: it finishes the run (charging the unknown kernels zero time, so **those numbers are invalid**) and writes the exact list of missing shapes to `tests/perfdb/<name>.missing/`, with a message telling you what to do. To complete the database you profile just those shapes **on a GPU** and merge them back:
 
 ```bash
-# Record on a GPU (profiles as usual, then writes/merges tests/perfdb/<NAME>/):
+# On any GPU machine (no Phantora build needed — just PyTorch):
+python3 tests/perfdb/bench.py --ref tests/perfdb/l40s.missing --out tests/perfdb/l40s --merge
+# then re-run the replay above — now complete, still no GPU on your machine.
+```
+
+This is the contribution loop: GPU-less users **discover** the shapes they need (no GPU), the few new timings get **profiled once** on any GPU, and because the database is plain CSV it's a clean pull request — so over time the common configs are already covered and nobody needs a GPU.
+
+### Recording / regenerating a database (on a GPU)
+
+```bash
+# Record a config while running it on a GPU (profiles, then writes/merges tests/perfdb/<NAME>/):
 python3 config_gen.py --nhost 1 --ngpu 8 --vram_mib 81920 --record-perf-db l40s
 ./run.sh ...
 # or record every preset at once:
 tests/perfdb/record_all.sh <NAME>
 ```
 
-To regenerate the database for a different GPU **without building Phantora at all**, `tests/perfdb/bench.py` re-profiles the recorded shapes using only stock PyTorch (it reads the keys from an existing DB and re-times each kernel on the local GPU):
+To build a database for a **different GPU without building Phantora at all**, `tests/perfdb/bench.py` re-profiles an existing database's shapes using only stock PyTorch (it reads the `(op, shape)` keys and re-times each kernel locally):
 
 ```bash
 python3 tests/perfdb/bench.py --ref tests/perfdb/l40s   # writes tests/perfdb/<your-gpu>/
 ```
 
-It mirrors Phantora's profiling (kernel-only timing, operand aliasing) and reproduces a Phantora-recorded database to ~1% per-op, giving an identical simulated iteration time.
-
-The committed `tests/perfdb/l40s/` was recorded on an NVIDIA L40S. The CSV is human-readable: each row is one `(op, shape) → nanoseconds` entry.
+It mirrors Phantora's profiler (kernel-only timing, operand aliasing) and reproduces a Phantora-recorded database to ~1% per-op, giving an identical simulated iteration time.
 
 ## Adapt your training scripts
 
