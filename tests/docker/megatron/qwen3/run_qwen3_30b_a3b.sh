@@ -7,15 +7,21 @@
 # Qwen/Qwen3-30B-A3B: hidden 2048, 48 layers, 32 heads / 4 KV heads, head_dim 128,
 # 128 experts top-8, expert ffn (moe_inter_dim) 768, vocab 151936.
 #
-# ~30.5B total / ~3.3B active. Needs expert (and typically tensor/pipeline)
-# parallelism plus recompute to fit; pass parallelism via $@, e.g.:
-#   python3 config_gen.py --nhost 8 --ngpu 8 --vram_mib 81920
-#   ./qwen3/run_qwen3_30b_a3b.sh --expert_model_parallel_size 8 --tensor_parallel_size 4 \
-#       --pipeline_model_parallel_size 2 --recompute_activations --sequence_length 4096
+# ~30.5B total / ~3.3B active. The 128 experts are sharded by expert parallelism;
+# tensor parallelism defaults to 1 here (override with --tensor_parallel_size).
+# Needs enough EP (and/or a larger --vram_mib) plus recompute to fit. On an 8-GPU
+# node (world = nhost*ngpu must equal TP*EP*PP):
+#   python3 config_gen.py --nhost 1 --ngpu 8 --vram_mib 81920
+#   ./qwen3/run_qwen3_30b_a3b.sh --expert_model_parallel_size 8 --recompute_activations
+# For larger clusters add --tensor_parallel_size / --pipeline_model_parallel_size
+# and size config_gen so nhost*ngpu == TP*EP*PP.
 
 WORKDIR=$(dirname "$(realpath "$0")")
 
 MODEL_ARGS=(
+    # TP=1 by default (test_megatron.py's default is 4, which would force
+    # world == 4*EP); override via --tensor_parallel_size.
+    --tensor_parallel_size 1
     --num_layers 48
     --hidden_size 2048
     --ffn_hidden_size 768
