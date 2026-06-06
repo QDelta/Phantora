@@ -1,4 +1,5 @@
 use crate::cuda_bindings::*;
+use crate::perf_db::FlashAttnKey;
 use cuda_call::CudaMemcpyKind;
 use pyo3::prelude::*;
 use pyo3::types::{IntoPyDict, PyNone, PyTuple};
@@ -69,10 +70,13 @@ fn round_multiple(x: i32, m: i32) -> i32 {
 
 pub struct CudaEstimator {
     memcpy_cache: HashMap<(CudaMemcpyKind, usize), Duration>,
+    flash_attn_cache: HashMap<FlashAttnKey, Duration>,
 
-    torch: Py<PyModule>,
-    flash_attn_cuda: Py<PyModule>,
-    device: PyObject,
+    // GPU handles. `None` in perf-db replay mode (no GPU): timings come from the
+    // preloaded caches and a miss is a hard error rather than a GPU profile.
+    torch: Option<Py<PyModule>>,
+    flash_attn_cuda: Option<Py<PyModule>>,
+    device: Option<PyObject>,
 }
 
 fn replay_memcpy(kind: CudaMemcpyKind, size: usize) -> Duration {
@@ -253,26 +257,87 @@ impl CudaEstimator {
 
         Self {
             memcpy_cache: HashMap::new(),
-            torch,
-            flash_attn_cuda,
-            device,
+            flash_attn_cache: HashMap::new(),
+            torch: Some(torch),
+            flash_attn_cuda: Some(flash_attn_cuda),
+            device: Some(device),
         }
+    }
+
+    /// Construct a GPU-less estimator that answers solely from a preloaded
+    /// performance database. No torch/flash-attn import, no warmup, no CUPTI.
+    pub fn new_replay(
+        memcpy_cache: HashMap<(CudaMemcpyKind, usize), Duration>,
+        flash_attn_cache: HashMap<FlashAttnKey, Duration>,
+    ) -> Self {
+        Self {
+            memcpy_cache,
+            flash_attn_cache,
+            torch: None,
+            flash_attn_cuda: None,
+            device: None,
+        }
+    }
+
+    fn is_replay(&self) -> bool {
+        self.torch.is_none()
+    }
+
+    pub fn memcpy_cache(&self) -> &HashMap<(CudaMemcpyKind, usize), Duration> {
+        &self.memcpy_cache
+    }
+
+    pub fn flash_attn_cache(&self) -> &HashMap<FlashAttnKey, Duration> {
+        &self.flash_attn_cache
+    }
+
+    /// Seed the caches from an existing DB (record mode merges into it).
+    pub fn preload(
+        &mut self,
+        memcpy: HashMap<(CudaMemcpyKind, usize), Duration>,
+        flash_attn: HashMap<FlashAttnKey, Duration>,
+    ) {
+        self.memcpy_cache.extend(memcpy);
+        self.flash_attn_cache.extend(flash_attn);
+    }
+
+    /// Name of the GPU being profiled (record mode), e.g. "NVIDIA L40S". Empty
+    /// in replay mode.
+    pub fn gpu_name(&self) -> String {
+        let Some(torch) = self.torch.as_ref() else {
+            return String::new();
+        };
+        Python::with_gil(|py| {
+            torch
+                .getattr(py, "cuda")
+                .and_then(|cuda| cuda.call_method1(py, "get_device_name", (0,)))
+                .and_then(|name| name.extract::<String>(py))
+                .unwrap_or_default()
+        })
     }
 
     pub fn memcpy(&mut self, kind: CudaMemcpyKind, size: usize) -> Duration {
         if let Some(&dur) = self.memcpy_cache.get(&(kind, size)) {
-            dur
-        } else {
-            let dur = replay_memcpy(kind, size);
-            self.memcpy_cache.insert((kind, size), dur);
-            dur
+            return dur;
         }
+        if self.is_replay() {
+            panic!(
+                "perf-db replay: missing memcpy timing for ({kind:?}, {size} bytes); \
+                 re-record the DB on a GPU for this config"
+            );
+        }
+        let dur = replay_memcpy(kind, size);
+        self.memcpy_cache.insert((kind, size), dur);
+        dur
     }
 
     fn alloc_torch_tensor(&mut self, py: Python, shape: &[i32], dtype: &PyObject) -> PyObject {
         let shape = PyTuple::new_bound(py, shape);
-        let kwargs = [("device", &self.device), ("dtype", dtype)].into_py_dict_bound(py);
+        let device = self.device.as_ref().expect("alloc_torch_tensor requires a GPU");
+        let kwargs = [("device", device), ("dtype", dtype)].into_py_dict_bound(py);
         self.torch
+            .as_ref()
+            .unwrap()
             .call_method_bound(py, "randn", shape, Some(&kwargs))
             .unwrap()
     }
@@ -291,13 +356,37 @@ impl CudaEstimator {
         window_size_right: i32,
         is_causal: bool,
     ) -> Duration {
-        Python::with_gil(|py| {
+        let key = FlashAttnKey {
+            is_fwd,
+            is_bf16,
+            batch_size,
+            seqlen_q,
+            seqlen_k,
+            num_heads,
+            num_heads_k,
+            head_size,
+            window_size_left,
+            window_size_right,
+            is_causal,
+        };
+        if let Some(&dur) = self.flash_attn_cache.get(&key) {
+            return dur;
+        }
+        if self.is_replay() {
+            panic!(
+                "perf-db replay: missing flash_attn timing for {key:?}; \
+                 re-record the DB on a GPU for this config"
+            );
+        }
+        let dur = Python::with_gil(|py| {
+            // Bind to owned PyObjects so no borrow of `self.torch` is held across
+            // the `&mut self` alloc_torch_tensor calls below.
             let dtype = if is_bf16 {
-                self.torch.getattr(py, "bfloat16").unwrap()
+                self.torch.as_ref().unwrap().getattr(py, "bfloat16").unwrap()
             } else {
-                self.torch.getattr(py, "float16").unwrap()
+                self.torch.as_ref().unwrap().getattr(py, "float16").unwrap()
             };
-            let float = self.torch.getattr(py, "float32").unwrap();
+            let float = self.torch.as_ref().unwrap().getattr(py, "float32").unwrap();
             if is_fwd {
                 let q = self.alloc_torch_tensor(
                     py,
@@ -360,7 +449,11 @@ impl CudaEstimator {
                 );
                 estimate!(
                     2,
-                    self.flash_attn_cuda.call_method1(py, "fwd", &args).unwrap()
+                    self.flash_attn_cuda
+                        .as_ref()
+                        .unwrap()
+                        .call_method1(py, "fwd", &args)
+                        .unwrap()
                 )
                 .1
             } else {
@@ -436,10 +529,16 @@ impl CudaEstimator {
                 );
                 estimate!(
                     2,
-                    self.flash_attn_cuda.call_method1(py, "bwd", &args).unwrap()
+                    self.flash_attn_cuda
+                        .as_ref()
+                        .unwrap()
+                        .call_method1(py, "bwd", &args)
+                        .unwrap()
                 )
                 .1
             }
-        })
+        });
+        self.flash_attn_cache.insert(key, dur);
+        dur
     }
 }

@@ -22,6 +22,17 @@ pub struct Args {
     /// disable sequence of calls optimization
     #[arg(long, action = clap::ArgAction::SetTrue)]
     pub disable_sequence_call: bool,
+
+    /// Replay kernel timings from a performance database directory instead of
+    /// profiling on a GPU. Skips all GPU/CUPTI init; a missing (op, shape) is a
+    /// hard error. Lets preset simulations run on a GPU-less machine.
+    #[arg(long, conflicts_with = "record_perf_db")]
+    pub perf_db: Option<path::PathBuf>,
+
+    /// Record kernel timings to a performance database directory: profile on the
+    /// GPU as usual, then write/merge the timing tables (CSV) on exit.
+    #[arg(long)]
+    pub record_perf_db: Option<path::PathBuf>,
 }
 
 fn parse_cores(s: &str) -> Result<Vec<usize>, Box<dyn Error + Send + Sync>> {

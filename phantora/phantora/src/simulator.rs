@@ -2,6 +2,7 @@ use crate::args;
 use crate::cuda_estimate::CudaEstimator;
 use crate::event_queue::{Action, EventId, EventQueue, QueueStep};
 use crate::nccl_ops::{NcclOps, SimpleRing, Trace};
+use crate::perf_db::PerfDb;
 use crate::torch_call::TorchCall;
 use crate::torch_estimate::TorchEstimator;
 use cuda_call::{
@@ -272,10 +273,60 @@ impl TorchCallSeq {
 }
 
 impl Simulator {
+    /// Build the timing estimators according to the perf-db mode:
+    /// - `--perf-db <dir>`: replay — load the DB, no GPU init, miss = hard error.
+    /// - `--record-perf-db <dir>`: GPU estimators, preloaded from an existing DB
+    ///   (if any) so the run merges into it; dumped on exit (see `handle_exit`).
+    /// - neither: GPU estimators, profile-on-miss (original behavior).
+    fn build_estimators() -> (CudaEstimator, TorchEstimator) {
+        let args = args::get_args();
+        if let Some(dir) = &args.perf_db {
+            let db = PerfDb::load(dir)
+                .unwrap_or_else(|e| panic!("perf-db: failed to load {}: {e}", dir.display()));
+            log::info!(
+                "perf-db replay: loaded {} compute, {} sequence, {} memcpy, {} flash_attn entries \
+                 (recorded on '{}') -- GPU not required",
+                db.compute.len(),
+                db.sequence.len(),
+                db.memcpy.len(),
+                db.flash_attn.len(),
+                db.gpu_name,
+            );
+            return (
+                CudaEstimator::new_replay(db.memcpy, db.flash_attn),
+                TorchEstimator::new_replay(db.compute, db.sequence),
+            );
+        }
+
+        let mut cuda = CudaEstimator::new();
+        let mut torch = TorchEstimator::new();
+        if let Some(dir) = &args.record_perf_db {
+            if dir.is_dir() {
+                match PerfDb::load(dir) {
+                    Ok(db) => {
+                        log::info!(
+                            "perf-db record: merging into existing DB at {} ({} compute entries)",
+                            dir.display(),
+                            db.compute.len(),
+                        );
+                        cuda.preload(db.memcpy, db.flash_attn);
+                        torch.preload(db.compute, db.sequence);
+                    }
+                    Err(e) => log::warn!(
+                        "perf-db record: could not load existing DB at {} ({e}); starting fresh",
+                        dir.display(),
+                    ),
+                }
+            }
+        }
+        (cuda, torch)
+    }
+
     pub fn new(netsim: netsim::simulator::Simulator) -> Self {
+        let (cuda_estimator, torch_estimator) = Self::build_estimators();
         Simulator {
-            cuda_estimator: CudaEstimator::new(),
-            torch_estimator: TorchEstimator::new(),
+            cuda_estimator,
+            torch_estimator,
 
             queue: EventQueue::new(netsim),
             stream_info: HashMap::new(),
@@ -302,7 +353,14 @@ impl Simulator {
         if calls.is_empty() {
             vec![]
         } else {
-            if args::get_args().disable_sequence_call {
+            let args = args::get_args();
+            // perf-db record/replay forces single-op timing. Sequence grouping
+            // below is timing-dependent (it splits on the simulated clock), so the
+            // groups -- and thus their hashes -- are not reproducible between a
+            // record run and a replay run, causing spurious misses. compute_cache
+            // is keyed purely by op+shape and is deterministic, so the DB is
+            // complete and replay never misses.
+            if args.disable_sequence_call || args.perf_db.is_some() || args.record_perf_db.is_some() {
                 calls
                     .into_iter()
                     .map(|(call, dur)| TorchCallSeq::Single(call, dur))
@@ -1613,5 +1671,30 @@ impl Simulator {
     pub fn handle_exit(&mut self, host: ResponseId, curr_time: i64) {
         log::debug!("{:?} exited at {}", host, curr_time);
         self.exited_hosts.insert(host.host, curr_time);
+
+        // In record mode, dump the profiled timing caches to the DB. Idempotent
+        // overwrite on each rank's exit (runs a handful of times); the last write
+        // holds the full set of shapes seen this run, merged with any preexisting
+        // DB that was preloaded at startup.
+        if let Some(dir) = &args::get_args().record_perf_db {
+            let db = PerfDb {
+                gpu_name: self.cuda_estimator.gpu_name(),
+                compute: self.torch_estimator.compute_cache().clone(),
+                sequence: self.torch_estimator.sequence_cache().clone(),
+                memcpy: self.cuda_estimator.memcpy_cache().clone(),
+                flash_attn: self.cuda_estimator.flash_attn_cache().clone(),
+            };
+            match db.save(dir) {
+                Ok(()) => log::info!(
+                    "perf-db record: wrote {} ({} compute, {} sequence, {} memcpy, {} flash_attn)",
+                    dir.display(),
+                    db.compute.len(),
+                    db.sequence.len(),
+                    db.memcpy.len(),
+                    db.flash_attn.len(),
+                ),
+                Err(e) => log::error!("perf-db record: failed to write {}: {e}", dir.display()),
+            }
+        }
     }
 }

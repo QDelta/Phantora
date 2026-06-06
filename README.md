@@ -118,6 +118,32 @@ TorchTitan (≥ 0.2.0) loads a Hugging Face tokenizer **directory** (`tokenizer.
 
 `run.sh` will pass its arguments to the corresponding scripts (`tests/test_{megatron,deepspeed,torchtitan}.py`). Each entry in the [model-preset table](#available-model-presets) links to a ready-made launcher you can run this way.
 
+## Run without a GPU (performance database)
+
+Phantora normally needs one GPU to *profile* each kernel's time. For the model presets, those timings can be **recorded once and replayed**, so the presets can be simulated on a machine with no GPU.
+
+A preset produces a fixed, enumerable set of kernel shapes, so a recorded **performance database** (`tests/perfdb/<gpu>/`, plain CSV) is complete for it. The simulator then answers timing queries from the database instead of touching the GPU.
+
+```bash
+# Replay on a GPU-less machine (uses the committed database; --perf-db drops the
+# simulator's GPU reservation, so no GPU is required):
+cd tests/docker/megatron
+python3 config_gen.py --nhost 1 --ngpu 8 --vram_mib 81920 --perf-db l40s
+./run.sh ./mixtral/run_mixtral_8x7b.sh --expert_model_parallel_size 8
+```
+
+The database is **specific to the GPU it was recorded on and to the run config** (parallelism, sequence length, micro-batch). `num_layers` does *not* matter — layers repeat identical shapes — so a database recorded at 4 layers serves the full-depth preset at the same config. If a run needs a shape that isn't in the database, the simulator stops with a clear error naming the missing op; record it (or your own GPU/config) with:
+
+```bash
+# Record on a GPU (profiles as usual, then writes/merges tests/perfdb/<NAME>/):
+python3 config_gen.py --nhost 1 --ngpu 8 --vram_mib 81920 --record-perf-db l40s
+./run.sh ...
+# or record every preset at once:
+tests/perfdb/record_all.sh <NAME>
+```
+
+The committed `tests/perfdb/l40s/` was recorded on an NVIDIA L40S. The CSV is human-readable: each row is one `(op, shape) → nanoseconds` entry.
+
 ## Adapt your training scripts
 
 Scripts and configurations in `tests/` will be good examples.

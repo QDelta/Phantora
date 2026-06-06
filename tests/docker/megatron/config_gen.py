@@ -1,26 +1,29 @@
 #!/usr/bin/env python3
 
-SIMULATOR_TEMPLATE = r"""
-  simulator:
-    image: "phantora:latest"
-    volumes:
-      - /run/phantora:/run/phantora
-      - ./netconfig.toml:/netconfig.toml:ro
-    pid: host
-    ipc: host
-    environment:
-      - PHANTORA_LOG=${{PHANTORA_LOG:-info}}
-      - PHANTORA_USE_CUPTI=${{PHANTORA_USE_CUPTI:-1}}
-      - PHANTORA_SOCKET_PREFIX=/run/phantora/phantora
-    command: /phantora/dist/phantora_server --netconfig /netconfig.toml
-    cpuset: '{cpuset}'
+GPU_RESERVATION = """
     deploy:
       resources:
         reservations:
           devices:
             - driver: nvidia
               device_ids: ['0']
-              capabilities: [gpu]
+              capabilities: [gpu]"""
+
+SIMULATOR_TEMPLATE = r"""
+  simulator:
+    image: "phantora:latest"
+    volumes:
+      - /run/phantora:/run/phantora
+      - ./netconfig.toml:/netconfig.toml:ro
+      - ../..:/phantora/tests
+    pid: host
+    ipc: host
+    environment:
+      - PHANTORA_LOG=${{PHANTORA_LOG:-info}}
+      - PHANTORA_USE_CUPTI=${{PHANTORA_USE_CUPTI:-1}}
+      - PHANTORA_SOCKET_PREFIX=/run/phantora/phantora
+    command: /phantora/dist/phantora_server --netconfig /netconfig.toml{perfdb_cmd}
+    cpuset: '{cpuset}'{gpu_reservation}
 """
 
 HOST_TEMPLATE = r"""
@@ -83,14 +86,30 @@ if __name__ == '__main__':
     parser.add_argument("--vram_mib", type=int, default=143771)
     parser.add_argument("--cpuset_sim", type=str, default=default_sim_core)
     parser.add_argument("--cpuset_host", type=str, default=default_host_cpuset)
+    parser.add_argument("--perf-db", dest="perf_db", type=str, default=None,
+                        help="Replay kernel timings from tests/perfdb/<NAME> (no GPU; "
+                             "drops the simulator GPU reservation).")
+    parser.add_argument("--record-perf-db", dest="record_perf_db", type=str, default=None,
+                        help="Record kernel timings into tests/perfdb/<NAME> (requires a GPU).")
     args = parser.parse_args()
+    if args.perf_db and args.record_perf_db:
+        parser.error("--perf-db and --record-perf-db are mutually exclusive")
+    if args.perf_db:
+        perfdb_cmd = f" --perf-db /phantora/tests/perfdb/{args.perf_db}"
+        gpu_reservation = ""  # replay needs no GPU
+    elif args.record_perf_db:
+        perfdb_cmd = f" --record-perf-db /phantora/tests/perfdb/{args.record_perf_db}"
+        gpu_reservation = GPU_RESERVATION
+    else:
+        perfdb_cmd = ""
+        gpu_reservation = GPU_RESERVATION
 
     nhosts = args.nhost
     ngpu = args.ngpu
 
     with open(join(script_dir, "compose.yaml"), "w") as f:
       f.write("services:")
-      f.write(SIMULATOR_TEMPLATE.format(cpuset=args.cpuset_sim))
+      f.write(SIMULATOR_TEMPLATE.format(cpuset=args.cpuset_sim, perfdb_cmd=perfdb_cmd, gpu_reservation=gpu_reservation))
       for i in range(1, nhosts + 1):
           f.write(HOST_TEMPLATE.format(
               host_id=i, ngpu=ngpu, vram_mib=args.vram_mib, cpuset=args.cpuset_host
