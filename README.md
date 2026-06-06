@@ -146,13 +146,28 @@ TorchTitan (≥ 0.2.0) loads a Hugging Face tokenizer **directory** (`tokenizer.
 
 `run.sh` will pass its arguments to the corresponding scripts (`tests/test_{megatron,deepspeed,torchtitan}.py`)
 
-### Mixture-of-Experts presets
+### Available model presets
 
-Ready-made MoE configurations live under `tests/docker/`. They exercise the expert all-to-all (and, for FSDP, the reduce-scatter) under the load-balanced-experts assumption described in [Framework feature support](#framework-feature-support):
+Each framework ships ready-to-run presets. `✓` links to the preset — a launcher script for Megatron/DeepSpeed (under `tests/docker/<framework>/`), or a `.toml` config for TorchTitan; `—` means there is no preset for that pair (the model may still be expressible by hand). All MoE presets assume **load-balanced experts** ([why](#control-flow-must-be-data-independent)).
 
-- **Megatron** — [`tests/docker/megatron/moe/run_moe_tiny.sh`](tests/docker/megatron/moe/run_moe_tiny.sh) (tiny Mixtral-style, 8 experts / top-2; run with `--expert_model_parallel_size ≥ 2`) and [`run_gpt_oss_20b.sh`](tests/docker/megatron/moe/run_gpt_oss_20b.sh) (a gpt-oss-20b-shaped throughput proxy).
-- **DeepSpeed** — `--model deepspeed_moe` (expert-parallel all-to-all) and [`tests/docker/deepspeed/gpt_oss/run_gpt_oss_tiny.sh`](tests/docker/deepspeed/gpt_oss/run_gpt_oss_tiny.sh) (the real Hugging Face gpt-oss model).
-- **TorchTitan** — [`tests/test_torchtitan_qwen3_moe.toml`](tests/test_torchtitan_qwen3_moe.toml) (qwen3 MoE with `expert_parallel_degree > 1`); pass it via `./run.sh --job.config_file=tests/test_torchtitan_qwen3_moe.toml --training.debug_moe_force_load_balance`.
+| Model | Megatron | DeepSpeed | TorchTitan |
+| --- | :---: | :---: | :---: |
+| **Dense** | | | |
+| Llama2 7B | [✓](tests/docker/megatron/llama/run_llama2_7b.sh) | [✓](tests/docker/deepspeed/llama/run_llama2_7b.sh) | — |
+| Llama2 13B | [✓](tests/docker/megatron/llama/run_llama2_13b.sh) | [✓](tests/docker/deepspeed/llama/run_llama2_13b.sh) | — |
+| Llama2 70B | [✓](tests/docker/megatron/llama/run_llama2_70b.sh) | [✓](tests/docker/deepspeed/llama/run_llama2_70b.sh) | — |
+| Llama3 8B | [✓](tests/docker/megatron/llama/run_llama3_8b.sh) | [✓](tests/docker/deepspeed/llama/run_llama3_8b.sh) | [✓](tests/docker/torchtitan/llama3/run_llama3_8b.sh) ¹ |
+| Llama3 70B | [✓](tests/docker/megatron/llama/run_llama3_70b.sh) | [✓](tests/docker/deepspeed/llama/run_llama3_70b.sh) | — |
+| **MoE** | | | |
+| Mixtral-style (tiny) | [✓](tests/docker/megatron/moe/run_moe_tiny.sh) | — | — |
+| Expert-parallel MoE (synthetic) | — | ✓ ² | — |
+| gpt-oss | [✓](tests/docker/megatron/moe/run_gpt_oss_20b.sh) ³ | [✓](tests/docker/deepspeed/gpt_oss/run_gpt_oss_tiny.sh) | — |
+| Qwen3 MoE | — | — | [✓](tests/test_torchtitan_qwen3_moe.toml) ⁴ |
+
+1. TorchTitan Llama3 8B also has a pipeline-parallel variant, [`test_torchtitan_llama3_8b_pp.toml`](tests/test_torchtitan_llama3_8b_pp.toml).
+2. DeepSpeed's expert-parallel all-to-all is exercised by a small synthetic MoE stack via `--model deepspeed_moe` (no dedicated launcher; experts are `Linear-GELU-Linear`).
+3. Megatron builds from its own `GPTModel`, so this matches gpt-oss-20b's *dimensions* as a throughput proxy, not the exact architecture (no attention sinks / clamped gating). DeepSpeed's gpt-oss is the real Hugging Face model.
+4. Run with `--training.debug_moe_force_load_balance`, e.g. `./run.sh --job.config_file=tests/test_torchtitan_qwen3_moe.toml --training.debug_moe_force_load_balance`.
 
 ## Adapt your training scripts
 
