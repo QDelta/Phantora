@@ -43,8 +43,11 @@ context_parallel_degree = 1
 [checkpoint]
 enable = false
 
+# Full activation checkpointing: at seq_len 8192 the un-checkpointed attention
+# activations alone exceed Phantora's 80GiB simulated GPU. (8B params + AdamW
+# fp32 optimizer states already take ~48GiB/rank under FSDP across 2 ranks.)
 [activation_checkpoint]
-mode = "none"
+mode = "full"
 
 [compile]
 enable = false

@@ -1,0 +1,46 @@
+# Qwen3 MoE on TorchTitan (>= 0.2.0). debugmodel_moe is a tiny MoE flavor; the real
+# ones are 30B-A3B / 235B-A22B. expert_parallel_degree > 1 exercises TorchTitan's
+# expert all-to-all. hf_assets_path points at any HF tokenizer dir (vocab only
+# matters for embedding dims under Phantora's payload-free sim).
+[job]
+dump_folder = "trace"
+description = "Qwen3 MoE training"
+
+[profiling]
+enable_profiling = false
+
+[metrics]
+log_freq = 1
+enable_tensorboard = false
+
+[model]
+name = "qwen3"
+flavor = "debugmodel_moe"
+hf_assets_path = "tests/assets/hf_tokenizer"
+
+[optimizer]
+name = "AdamW"
+lr = 3e-4
+
+[lr_scheduler]
+warmup_steps = 2
+
+[training]
+local_batch_size = 2
+seq_len = 1024
+max_norm = 1.0
+steps = 3
+dataset = "c4_test"
+
+[parallelism]
+data_parallel_shard_degree = -1
+expert_parallel_degree = 2
+
+[checkpoint]
+enable = false
+
+[activation_checkpoint]
+mode = "none"
+
+[compile]
+enable = false

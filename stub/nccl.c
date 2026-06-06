@@ -300,13 +300,22 @@ ncclRedOpCreatePreMulSum(ncclRedOp_t* op,
                          ncclScalarResidence_t residence,
                          ncclComm_t comm)
 {
-    NOT_IMPLEMENTED;
+    // PreMulSum is a sum reduction with a per-rank pre-multiplication by a
+    // scalar (used by FSDP2 to fold the gradient pre-divide into the
+    // reduce-scatter). Under Phantora's payload-free sim only the collective's
+    // cost is modeled, which is identical to a plain sum; the scalar only
+    // scales (garbage) data. So alias the op to ncclSum.
+    if (op == NULL)
+        return ncclInvalidArgument;
+    *op = ncclSum;
+    return ncclSuccess;
 }
 
 ncclResult_t
 ncclRedOpDestroy(ncclRedOp_t op, ncclComm_t comm)
 {
-    NOT_IMPLEMENTED;
+    // No dynamic state is allocated for PreMulSum (it aliases ncclSum).
+    return ncclSuccess;
 }
 
 ncclResult_t

@@ -202,6 +202,130 @@ def install_phantora_deepspeed_patches() -> None:
     PipelineEngine._phantora_cpu_meta = True
 
 
+def install_phantora_torchtitan_moe_patches() -> None:
+    """Make TorchTitan (>=0.2.0) MoE runnable under Phantora's payload-free sim.
+
+    Must run BEFORE the model is built (the dispatch hook is captured at
+    parallelize time). Call from tests/test_torchtitan.py at import.
+
+    TorchTitan's ``ExpertParallel._token_dispatch`` sizes the expert all-to-all
+    from ``num_tokens_per_expert`` (per-expert routing counts). Under simulation
+    those GPU values are garbage, and ``.tolist()`` of the derived splits yields
+    garbage sizes -> the token all-to-all tries to allocate astronomically (OOM).
+    Replace it with the analytic LOAD-BALANCED splits: the number of routed tokens
+    is ``routed_input.shape[0]`` (a real shape, not a garbage value), so each of
+    ``num_experts`` experts gets ``total // num_experts``; the per-EP-rank splits
+    are uniform Python int lists. The real token all-to-all and the _permute still
+    run (so timing/shapes are simulated); only the routing-derived sizes are made
+    deterministic. (torchtitan's own --training.debug_moe_force_load_balance is not
+    enough here: it balances the assignment but the counts are still read from GPU
+    tensors whose values are garbage under payload-free sim.)
+    """
+    if os.environ.get("PHANTORA") is None:
+        return
+    try:
+        import torch
+        import torchtitan.distributed.expert_parallel as ep_mod
+        from torchtitan.distributed.expert_parallel import ExpertParallel
+    except (ImportError, AttributeError):
+        return
+    if getattr(ExpertParallel, "_phantora_balanced", False):
+        return
+
+    # Force the for-loop expert path instead of the triton grouped-GEMM path.
+    # GroupedExperts.forward branches on self.use_grouped_mm; the grouped-mm
+    # kernel is a triton GEMM whose compiled runtime needs CUDA driver symbols
+    # (cuFuncSetAttribute, ...) the Phantora stub does not export -> ImportError.
+    # The for-loop path uses plain torch bmm/matmul that Phantora already
+    # simulates. Wrap GroupedExperts.__init__ to clear the flag post-init.
+    try:
+        from torchtitan.models.moe.moe import GroupedExperts
+        if not getattr(GroupedExperts, "_phantora_no_grouped_mm", False):
+            _orig_ge_init = GroupedExperts.__init__
+
+            def _ge_init(self, *a, **kw):
+                _orig_ge_init(self, *a, **kw)
+                self.use_grouped_mm = False
+
+            GroupedExperts.__init__ = _ge_init
+            GroupedExperts._phantora_no_grouped_mm = True
+    except (ImportError, AttributeError):
+        pass
+
+    # Round-up helper (matches torchtitan.tools.utils._round_up) without importing
+    # so the shim works regardless of internal moves.
+    def _round_up(x, m):
+        return ((x + m - 1) // m) * m
+
+    def _analytic_permute(x, ep_degree, num_local_experts, per_expert):
+        """Reproduce torchtitan's _permute analytically for the load-balanced
+        case, avoiding generate_permute_indices (a triton kernel that needs CUDA
+        driver symbols the Phantora stub lacks) AND avoiding any .item()/.tolist()
+        on GPU tensors (garbage under payload-free sim).
+
+        Mirrors torchtitan.models.moe.utils._permute + generate_permute_indices
+        with all per-(rank,expert) token counts equal to ``per_expert``.
+        """
+        import torchtitan.models.moe.utils as _mu
+        align = _mu.TOKEN_GROUP_ALIGN_SIZE_M
+        num_ranks = ep_degree
+        experts_per_rank = num_local_experts
+        # vstack a zero row (target for -1 / padding indices), as _permute does.
+        x = torch.vstack((x, x.new_zeros((x.shape[-1]))))
+        input_shape = x.shape
+        orig_rows = x.shape[0] - 1  # == num_experts * per_expert
+        padded_max_len = _round_up(orig_rows + experts_per_rank * align, align)
+        # m_sizes: per local expert, total tokens summed over ranks, padded to align.
+        total_per_local = max(num_ranks * per_expert, align)
+        m_size_val = _round_up(total_per_local, align)
+        # CPU tensor so the for-loop expert path can .tolist() real values.
+        m_sizes = torch.full((experts_per_rank,), m_size_val, dtype=torch.int32)
+        # Build permuted_indices on CPU (real values), then move to x.device.
+        permuted_indices = torch.full((padded_max_len,), -1, dtype=torch.int64)
+        for e in range(experts_per_rank):
+            write_start = e * m_size_val
+            for r in range(num_ranks):
+                i = r * experts_per_rank + e
+                start_index = i * per_expert
+                end = min(write_start + per_expert, padded_max_len)
+                if end > write_start:
+                    n = end - write_start
+                    permuted_indices[write_start:end] = torch.arange(
+                        start_index, start_index + n, dtype=torch.int64
+                    )
+                write_start += per_expert
+        permuted_indices = permuted_indices.to(x.device)
+        x = x[permuted_indices, :]
+        return input_shape, x, permuted_indices, m_sizes
+
+    def _balanced_token_dispatch(self, mod, inputs, device_mesh):
+        routed_input, num_tokens_per_expert = inputs
+        ep_degree = device_mesh.shape[0]
+        num_experts = num_tokens_per_expert.shape[0]
+        num_local_experts = num_experts // ep_degree
+        total_routed = routed_input.shape[0]  # real shape (num_tokens * top_k locally)
+        per_expert = total_routed // num_experts
+        # Uniform, load-balanced splits as Python int lists (sum == total_routed
+        # when total_routed is divisible by num_experts, which holds under balance).
+        self.input_splits = [num_local_experts * per_expert] * ep_degree
+        self.output_splits = [num_local_experts * per_expert] * ep_degree
+        routed_input = ep_mod.all_to_all_single_autograd(
+            routed_input, self.output_splits, self.input_splits, device_mesh.get_group()
+        )
+        (
+            self.input_shape,
+            routed_input,
+            self.permuted_indices,
+            num_tokens_per_expert_group,
+        ) = _analytic_permute(
+            routed_input, ep_degree, num_local_experts, per_expert
+        )
+        return routed_input, num_tokens_per_expert_group
+
+    ExpertParallel._token_dispatch = _balanced_token_dispatch
+    ExpertParallel._phantora_balanced = True
+
+
 def install_phantora_torchtitan_patches() -> None:
     """Patch TorchTitan PP shape-inference metadata exchange.
 
