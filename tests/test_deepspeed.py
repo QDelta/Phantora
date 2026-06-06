@@ -145,6 +145,13 @@ class _DeepSpeedMoEModel(nn.Module):
 
 def run_deepspeed_moe(args: argparse.Namespace, rank: int) -> None:
     """Train loop for a deepspeed.moe expert-parallel model (exercises the all-to-all)."""
+    # top2gating adds gumbel_rsample noise to the gate logits, which builds a
+    # torch.distributions.Gumbel from scalar GPU tensors. Under payload-free sim
+    # those tensors hold garbage (zeros_like/ones_like never actually run), so the
+    # Uniform(low<high) arg-check inside Gumbel spuriously fails. The noise only
+    # perturbs routing, which is irrelevant to DeepSpeed's fixed-capacity dispatch,
+    # so disable distribution arg-validation rather than skip the (timed) gating.
+    torch.distributions.Distribution.set_default_validate_args(False)
     torch.set_default_dtype(torch.bfloat16)
     model = _DeepSpeedMoEModel(
         args.hidden_size, args.ffn_hidden_size, args.num_experts,

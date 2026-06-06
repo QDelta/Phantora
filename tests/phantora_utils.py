@@ -205,26 +205,38 @@ def install_phantora_deepspeed_patches() -> None:
 def install_phantora_torchtitan_moe_patches() -> None:
     """Make TorchTitan (>=0.2.0) MoE runnable under Phantora's payload-free sim.
 
-    Must run BEFORE the model is built (the dispatch hook is captured at
-    parallelize time). Call from tests/test_torchtitan.py at import.
+    Must run BEFORE the model is built (the dispatch hook and GroupedExperts are
+    captured at parallelize/build time). Call from tests/test_torchtitan.py at
+    import. No-op for dense models / non-MoE runs.
 
-    TorchTitan's ``ExpertParallel._token_dispatch`` sizes the expert all-to-all
-    from ``num_tokens_per_expert`` (per-expert routing counts). Under simulation
-    those GPU values are garbage, and ``.tolist()`` of the derived splits yields
-    garbage sizes -> the token all-to-all tries to allocate astronomically (OOM).
-    Replace it with the analytic LOAD-BALANCED splits: the number of routed tokens
-    is ``routed_input.shape[0]`` (a real shape, not a garbage value), so each of
-    ``num_experts`` experts gets ``total // num_experts``; the per-EP-rank splits
-    are uniform Python int lists. The real token all-to-all and the _permute still
-    run (so timing/shapes are simulated); only the routing-derived sizes are made
-    deterministic. (torchtitan's own --training.debug_moe_force_load_balance is not
-    enough here: it balances the assignment but the counts are still read from GPU
-    tensors whose values are garbage under payload-free sim.)
+    Three patches, all assuming experts are LOAD BALANCED (uniform tokens/expert):
+
+    1. Force GroupedExperts off the triton grouped-GEMM path. GroupedExperts.forward
+       branches on ``self.use_grouped_mm``; the grouped-mm kernel is a triton GEMM
+       whose compiled runtime needs CUDA driver symbols (cuFuncSetAttribute, ...) the
+       Phantora stub does not export -> ImportError. The for-loop path uses plain
+       torch matmul that Phantora already simulates.
+
+    2. Replace ``ExpertParallel._token_dispatch``'s split sizing. The real code
+       derives the expert all-to-all splits from ``num_tokens_per_expert`` (per-expert
+       routing counts); under simulation those GPU values are garbage and ``.tolist()``
+       of the derived splits yields garbage sizes -> the all-to-all allocates
+       astronomically (OOM). Instead size the splits analytically from the real shape
+       ``routed_input.shape[0]`` (each of ``num_experts`` experts gets ``total //
+       num_experts``), as uniform Python int lists. The all-to-all itself still runs.
+
+    3. Reproduce torchtitan's ``_permute`` analytically (``_analytic_permute``). The
+       real one calls ``generate_permute_indices`` (another triton kernel) and does
+       ``.item()``/``.tolist()`` on GPU count tensors (garbage); the analytic version
+       builds the permutation on CPU from the load-balanced counts and returns the
+       per-expert sizes on CPU so the for-loop expert path's ``.tolist()`` is real.
+
+    (torchtitan's own --training.debug_moe_force_load_balance is not enough: it
+    balances the assignment but the counts are still read from garbage GPU tensors.)
     """
     if os.environ.get("PHANTORA") is None:
         return
     try:
-        import torch
         import torchtitan.distributed.expert_parallel as ep_mod
         from torchtitan.distributed.expert_parallel import ExpertParallel
     except (ImportError, AttributeError):
