@@ -35,15 +35,13 @@ Ready-to-run presets ship for each framework. `✅` links to the preset — a la
 | Llama3 70B | [✅](tests/docker/megatron/llama/run_llama3_70b.sh) | [✅](tests/docker/deepspeed/llama/run_llama3_70b.sh) | — |
 | **MoE** | | | |
 | Mixtral 8×7B | [✅](tests/docker/megatron/moe/run_mixtral_8x7b.sh) ² | — | — |
-| Expert-parallel MoE (synthetic) | — | ✅ ³ | — |
-| gpt-oss | [✅](tests/docker/megatron/moe/run_gpt_oss_20b.sh) ⁴ | [✅](tests/docker/deepspeed/gpt_oss/run_gpt_oss_tiny.sh) | — |
-| Qwen3 MoE | — | — | [✅](tests/test_torchtitan_qwen3_moe.toml) ⁵ |
+| gpt-oss | [✅](tests/docker/megatron/moe/run_gpt_oss_20b.sh) ³ | [✅](tests/docker/deepspeed/gpt_oss/run_gpt_oss_tiny.sh) | — |
+| Qwen3 MoE | — | — | [✅](tests/test_torchtitan_qwen3_moe.toml) ⁴ |
 
 1. TorchTitan Llama3 8B also has a pipeline-parallel variant, [`test_torchtitan_llama3_8b_pp.toml`](tests/test_torchtitan_llama3_8b_pp.toml).
 2. The real Mixtral architecture — Megatron-core's MoE GPTModel *is* GQA + RoPE + top-2-of-8 SwiGLU experts. For a quick check, scale it down with `--num_layers` / `--hidden_size` overrides.
-3. DeepSpeed's expert-parallel all-to-all is exercised by a small synthetic MoE stack via `--model deepspeed_moe` (no dedicated launcher; experts are `Linear-GELU-Linear`).
-4. Megatron builds from its own `GPTModel`, so this matches gpt-oss-20b's *dimensions* as a throughput proxy, not the exact architecture (no attention sinks / clamped gating). DeepSpeed's gpt-oss is the real Hugging Face model.
-5. Run with `--training.debug_moe_force_load_balance`, e.g. `./run.sh --job.config_file=tests/test_torchtitan_qwen3_moe.toml --training.debug_moe_force_load_balance`.
+3. Megatron builds from its own `GPTModel`, so this matches gpt-oss-20b's *dimensions* as a throughput proxy, not the exact architecture (no attention sinks / clamped gating). DeepSpeed's gpt-oss is the real Hugging Face model.
+4. Run with `--training.debug_moe_force_load_balance`, e.g. `./run.sh --job.config_file=tests/test_torchtitan_qwen3_moe.toml --training.debug_moe_force_load_balance`.
 
 See [Try our examples](#try-our-examples) for how to launch one.
 
@@ -234,7 +232,7 @@ Concretely:
 
 Phantora models the timing and ordering of point-to-point transfers, but it does not transfer bytes between ranks. Framework paths that inspect activation values or other transferred tensor payloads need to use a CPU backend path for now. Two consequences worth calling out:
 
-- **MoE assumes load-balanced experts.** Because expert routing reads garbage tensor values (see [Control flow must be data-independent](#control-flow-must-be-data-independent)), Phantora's framework shims in [`tests/phantora_utils.py`](tests/phantora_utils.py) replace the data-dependent dispatch sizing with the analytic *uniform* distribution: every expert receives an equal share of tokens. The expert all-to-all itself is still simulated, so this gives a faithful throughput/MFU estimate for a balanced workload, but it does not model routing imbalance, capacity overflow, or token dropping. Covered today: Megatron (EP, and TP+EP with sequence parallelism), DeepSpeed (`deepspeed.moe` expert-parallel all-to-all, and the Hugging Face gpt-oss architecture whose experts run locally per rank), and TorchTitan (qwen3 expert parallelism).
+- **MoE assumes load-balanced experts.** Because expert routing reads garbage tensor values (see [Control flow must be data-independent](#control-flow-must-be-data-independent)), Phantora's framework shims in [`tests/phantora_utils.py`](tests/phantora_utils.py) replace the data-dependent dispatch sizing with the analytic *uniform* distribution: every expert receives an equal share of tokens. The expert all-to-all itself is still simulated, so this gives a faithful throughput/MFU estimate for a balanced workload, but it does not model routing imbalance, capacity overflow, or token dropping. Covered today: Megatron (EP, and TP+EP with sequence parallelism), DeepSpeed (the Hugging Face gpt-oss architecture, whose experts run locally per rank under DP/ZeRO), and TorchTitan (qwen3 expert parallelism).
 - **DeepEP — on the roadmap.** Some recent MoE training stacks (e.g., DeepSeek-style models) bypass NCCL entirely and use [DeepEP](https://github.com/deepseek-ai/DeepEP) for expert dispatch/combine. We plan to add a DeepEP interception layer so those stacks can be simulated as well.
 
 ### Limited NCCL coverage
