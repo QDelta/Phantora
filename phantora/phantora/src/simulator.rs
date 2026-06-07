@@ -6,7 +6,7 @@ use crate::torch_call::TorchCall;
 use crate::torch_estimate::TorchEstimator;
 use cuda_call::{
     capi, CudaCall, CudaCallMsg, CudaEvent, CudaMemcpyKind, CudaStream, HostId, NcclComm,
-    NcclDatatype, ResponseId, SplitResponse, SyncResponse,
+    NcclDatatype, QueryResponse, ResponseId, SplitResponse, SyncResponse,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -101,6 +101,26 @@ fn send_sync_response_to(
     let resp = bincode::serialize(&SyncResponse { end_time }).unwrap();
     send_response_to(&host, resp);
     update_host_sync(host_times, host.host, end_time, event);
+}
+
+/// Reply to a non-blocking poll without fast-forwarding the clock. When ready,
+/// record the event completion as a sync point; when not ready, leave the
+/// host's virtual time untouched (it charges its own poll cost) and just record
+/// its current position.
+fn send_query_response_to(
+    host_times: &mut HashMap<HostId, HostTime>,
+    host: ResponseId,
+    ready: bool,
+    end_time: i64,
+    event: Option<EventId>,
+) {
+    let resp = bincode::serialize(&QueryResponse { ready, end_time }).unwrap();
+    send_response_to(&host, resp);
+    if ready {
+        update_host_sync(host_times, host.host, end_time, event);
+    } else {
+        update_host_curr(host_times, host.host, end_time);
+    }
 }
 
 #[derive(strum::Display, Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -656,10 +676,9 @@ impl Simulator {
     }
 
     fn cuda_stream_query(&mut self, host: ResponseId, curr_time: i64, stream: CudaStream) {
-        // Same reasoning as cuda_event_query: a CPU poll loop on a stream cannot
-        // advance virtual time, so a pending stream would never drain. Fast-forward
-        // to the stream's last event (if any) and report it complete, advancing the
-        // host clock via the sync response.
+        // Non-blocking poll on a stream: report whether its last event has
+        // completed at curr_time, without fast-forwarding. See cuda_event_query
+        // for why we no longer treat the poll as a synchronize.
         let key = (host.host.clone(), stream);
         let last_event = match self.stream_info.get_mut(&key) {
             Some(sinfo) => {
@@ -676,13 +695,12 @@ impl Simulator {
         );
         match last_event {
             Some(event) => match self.queue.query(&event) {
-                Some(time) => send_sync_response_to(&mut self.host_times, host, time, Some(event)),
-                None => {
-                    self.syncing.insert(event, host);
-                    self.execute_to_event(event);
+                Some(time) => {
+                    send_query_response_to(&mut self.host_times, host, true, time, Some(event))
                 }
+                None => send_query_response_to(&mut self.host_times, host, false, curr_time, None),
             },
-            None => send_sync_response_to(&mut self.host_times, host, curr_time, None),
+            None => send_query_response_to(&mut self.host_times, host, true, curr_time, None),
         }
     }
 
@@ -730,16 +748,26 @@ impl Simulator {
     }
 
     fn cuda_event_query(&mut self, host: ResponseId, curr_time: i64, event: CudaEvent) {
-        // A non-blocking event poll cannot make progress under simulation: virtual
-        // time only advances when the host issues work, but a CPU poll loop (e.g.
-        // ZeRO-3's param-fetch coordinator, the caching allocator) issues none
-        // between polls, so a pending event would never complete and the host
-        // would spin forever on cudaEventQuery. Resolve the poll the way a
-        // synchronize does -- fast-forward virtual time to the event's completion
-        // and report it complete; the host adopts the advanced clock via the sync
-        // response. Events are pure ordering markers under payload-free sim, so
-        // treating "poll" as "wait for completion" is correct and keeps timing.
-        self.cuda_event_synchronize(host, curr_time, event);
+        // Non-blocking event poll: report the truthful completion status at
+        // curr_time WITHOUT fast-forwarding the clock, so application control
+        // flow that branches on a not-ready event (e.g. "if not ready, do other
+        // work") is preserved. Under ignore-cpu-time mode the host charges a
+        // poll cost per not-ready reply, so a pure poll loop still advances
+        // virtual time and eventually observes completion instead of spinning
+        // forever on a clock that cannot move during a poll.
+        Self::execute_to_time(
+            &mut self.queue,
+            &mut self.syncing,
+            &mut self.host_times,
+            curr_time,
+        );
+        let event = self.id_of_cuda[&(host.host.clone(), event)];
+        match self.queue.query(&event) {
+            Some(time) => {
+                send_query_response_to(&mut self.host_times, host, true, time, Some(event))
+            }
+            None => send_query_response_to(&mut self.host_times, host, false, curr_time, None),
+        }
     }
 
     fn cuda_add_latency(

@@ -17,6 +17,28 @@ static TIME_OFFSET: AtomicI64 = AtomicI64::new(0); // microseconds
 static INITIAL_CPU_TIME: AtomicI64 = AtomicI64::new(0);
 static INITIAL_SYSTEM_TIME: AtomicI64 = AtomicI64::new(0);
 
+/// Virtual cost (microseconds) charged per non-blocking poll that returns
+/// not-ready while in ignore-cpu-time mode. In that mode virtual time only
+/// advances on sync responses, so a pure poll loop (e.g. ZeRO-3's param-fetch
+/// coordinator) would spin forever on a clock that never moves. Charging a
+/// small cost per poll lets the loop advance time and eventually observe the
+/// event's completion, while keeping the query itself non-blocking so
+/// application control flow that branches on a not-ready event is preserved.
+///
+/// The default (100us) sits on the stable floor: pure spin loops converge to
+/// the event completion time regardless of this constant (polls x cost == the
+/// real wait), so the value only matters for opportunistic polls (e.g. torch's
+/// caching allocator reclaiming blocks). Measured on gpt-oss/DeepSpeed ZeRO-3,
+/// any value up to ~100us gives the same result; larger values (>=1ms) start
+/// phantom-charging the allocator's opportunistic polls and over-count.
+/// Override with PHANTORA_QUERY_POLL_US.
+static QUERY_POLL_US: LazyLock<i64> = LazyLock::new(|| {
+    env::var("PHANTORA_QUERY_POLL_US")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(100)
+});
+
 #[ctor]
 fn initialize_times() {
     INITIAL_CPU_TIME.store(current_cpu_time_us(), Ordering::SeqCst);
@@ -389,15 +411,24 @@ pub extern "C" fn cuda_event_query(
     id: i32,
     time_ref: *mut ffi::c_long,
 ) -> i32 {
-    // The simulator fast-forwards virtual time to the event's completion (like a
-    // synchronize) and replies with that time; adopt it as the local clock and
-    // report the event complete. This terminates CPU poll loops that would
-    // otherwise spin forever (virtual time can't advance during a pure poll).
+    // Non-blocking poll: the simulator reports the truthful completion status at
+    // the current virtual time without fast-forwarding, so control flow that
+    // branches on a not-ready event is preserved. If not ready, charge a poll
+    // cost (ignore-cpu-time mode only) so a spin loop advances time instead of
+    // deadlocking on a clock that can't move during a pure poll.
     let resp =
         send_cuda_call_get_response(CudaCall::CudaEventQuery(CudaEvent { device, stream, id }));
-    let end_time = handle_sync_response(resp);
-    unsafe { *time_ref = end_time };
-    1
+    let msg = bincode::deserialize::<QueryResponse>(&resp).unwrap();
+    if msg.ready {
+        unsafe { *time_ref = msg.end_time };
+        1
+    } else {
+        if ignore_cpu_time() {
+            TIME_OFFSET.fetch_add(*QUERY_POLL_US, Ordering::SeqCst);
+        }
+        unsafe { *time_ref = get_current_sim_time() };
+        0
+    }
 }
 
 #[no_mangle]
@@ -410,13 +441,19 @@ pub extern "C" fn cuda_add_latency(device: i32, stream: i32, latency: i64) {
 
 #[no_mangle]
 pub extern "C" fn cuda_stream_query(device: i32, stream: i32) -> i32 {
-    // See cuda_event_query: the simulator fast-forwards to the stream's last event
-    // and replies with the completion time; adopt it and report complete so CPU
-    // poll loops terminate instead of spinning on a clock that can't advance.
+    // See cuda_event_query: non-blocking poll, truthful status, poll cost charged
+    // on not-ready (ignore-cpu-time mode) so a spin loop can make progress.
     let resp =
         send_cuda_call_get_response(CudaCall::CudaStreamQuery(CudaStream { device, id: stream }));
-    handle_sync_response(resp);
-    1
+    let msg = bincode::deserialize::<QueryResponse>(&resp).unwrap();
+    if msg.ready {
+        1
+    } else {
+        if ignore_cpu_time() {
+            TIME_OFFSET.fetch_add(*QUERY_POLL_US, Ordering::SeqCst);
+        }
+        0
+    }
 }
 
 // #[repr(C)]
