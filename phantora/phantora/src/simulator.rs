@@ -103,10 +103,9 @@ fn send_sync_response_to(
     update_host_sync(host_times, host.host, end_time, event);
 }
 
-/// Reply to a non-blocking poll without fast-forwarding the clock. When ready,
-/// record the event completion as a sync point; when not ready, leave the
-/// host's virtual time untouched (it charges its own poll cost) and just record
-/// its current position.
+/// Reply to a non-blocking poll. When ready, record the event completion as a
+/// sync point; when not ready, leave the host's virtual time untouched (it
+/// charges its own poll cost) and just record its current position.
 fn send_query_response_to(
     host_times: &mut HashMap<HostId, HostTime>,
     host: ResponseId,
@@ -677,8 +676,7 @@ impl Simulator {
 
     fn cuda_stream_query(&mut self, host: ResponseId, curr_time: i64, stream: CudaStream) {
         // Non-blocking poll on a stream: report whether its last event has
-        // completed at curr_time, without fast-forwarding. See cuda_event_query
-        // for why we no longer treat the poll as a synchronize.
+        // completed at curr_time. See cuda_event_query.
         let key = (host.host.clone(), stream);
         let last_event = match self.stream_info.get_mut(&key) {
             Some(sinfo) => {
@@ -748,13 +746,13 @@ impl Simulator {
     }
 
     fn cuda_event_query(&mut self, host: ResponseId, curr_time: i64, event: CudaEvent) {
-        // Non-blocking event poll: report the truthful completion status at
-        // curr_time WITHOUT fast-forwarding the clock, so application control
-        // flow that branches on a not-ready event (e.g. "if not ready, do other
-        // work") is preserved. Under ignore-cpu-time mode the host charges a
-        // poll cost per not-ready reply, so a pure poll loop still advances
-        // virtual time and eventually observes completion instead of spinning
-        // forever on a clock that cannot move during a poll.
+        // Non-blocking event poll: report whether the event has completed at
+        // curr_time, so application control flow that branches on a not-ready
+        // event (e.g. "if not ready, do other work") is preserved. Under
+        // ignore-cpu-time mode the host charges a poll cost per not-ready reply,
+        // so a pure poll loop still advances virtual time and eventually
+        // observes completion instead of spinning forever on a clock that
+        // cannot move during a poll.
         Self::execute_to_time(
             &mut self.queue,
             &mut self.syncing,

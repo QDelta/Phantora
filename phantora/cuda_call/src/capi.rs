@@ -411,11 +411,11 @@ pub extern "C" fn cuda_event_query(
     id: i32,
     time_ref: *mut ffi::c_long,
 ) -> i32 {
-    // Non-blocking poll: the simulator reports the truthful completion status at
-    // the current virtual time without fast-forwarding, so control flow that
-    // branches on a not-ready event is preserved. If not ready, charge a poll
-    // cost (ignore-cpu-time mode only) so a spin loop advances time instead of
-    // deadlocking on a clock that can't move during a pure poll.
+    // Non-blocking poll: the simulator reports whether the event has completed
+    // at the current virtual time, so control flow that branches on a not-ready
+    // event is preserved. If not ready, charge a poll cost (ignore-cpu-time mode
+    // only) so a spin loop advances time instead of deadlocking on a clock that
+    // can't move during a pure poll.
     let resp =
         send_cuda_call_get_response(CudaCall::CudaEventQuery(CudaEvent { device, stream, id }));
     let msg = bincode::deserialize::<QueryResponse>(&resp).unwrap();

@@ -265,9 +265,9 @@ pub struct SyncResponse {
 }
 
 /// Reply to a non-blocking poll (`cudaEventQuery`/`cudaStreamQuery`). `ready`
-/// reports the truthful completion status at the host's current virtual time
-/// (the poll does NOT fast-forward the clock); `end_time` is the event's
-/// completion time when ready (for `cudaEventElapsedTime`).
+/// reports whether the event has completed at the host's current virtual time;
+/// `end_time` is the event's completion time when ready (for
+/// `cudaEventElapsedTime`).
 #[derive(Debug, Serialize, Deserialize)]
 pub struct QueryResponse {
     pub ready: bool,
