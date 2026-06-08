@@ -418,16 +418,19 @@ pub extern "C" fn cuda_event_query(
     // can't move during a pure poll.
     let resp =
         send_cuda_call_get_response(CudaCall::CudaEventQuery(CudaEvent { device, stream, id }));
-    let msg = bincode::deserialize::<QueryResponse>(&resp).unwrap();
-    if msg.ready {
-        unsafe { *time_ref = msg.end_time };
-        1
-    } else {
-        if ignore_cpu_time() {
-            TIME_OFFSET.fetch_add(*QUERY_POLL_US, Ordering::SeqCst);
+    // Some(completion_time) = complete; None = not ready.
+    match bincode::deserialize::<Option<i64>>(&resp).unwrap() {
+        Some(end_time) => {
+            unsafe { *time_ref = end_time };
+            1
         }
-        unsafe { *time_ref = get_current_sim_time() };
-        0
+        None => {
+            if ignore_cpu_time() {
+                TIME_OFFSET.fetch_add(*QUERY_POLL_US, Ordering::SeqCst);
+            }
+            unsafe { *time_ref = get_current_sim_time() };
+            0
+        }
     }
 }
 
@@ -445,8 +448,11 @@ pub extern "C" fn cuda_stream_query(device: i32, stream: i32) -> i32 {
     // on not-ready (ignore-cpu-time mode) so a spin loop can make progress.
     let resp =
         send_cuda_call_get_response(CudaCall::CudaStreamQuery(CudaStream { device, id: stream }));
-    let msg = bincode::deserialize::<QueryResponse>(&resp).unwrap();
-    if msg.ready {
+    // Some(completion_time) = complete; None = not ready.
+    if bincode::deserialize::<Option<i64>>(&resp)
+        .unwrap()
+        .is_some()
+    {
         1
     } else {
         if ignore_cpu_time() {

@@ -6,7 +6,7 @@ use crate::torch_call::TorchCall;
 use crate::torch_estimate::TorchEstimator;
 use cuda_call::{
     capi, CudaCall, CudaCallMsg, CudaEvent, CudaMemcpyKind, CudaStream, HostId, NcclComm,
-    NcclDatatype, QueryResponse, ResponseId, SplitResponse, SyncResponse,
+    NcclDatatype, ResponseId, SplitResponse, SyncResponse,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -103,22 +103,22 @@ fn send_sync_response_to(
     update_host_sync(host_times, host.host, end_time, event);
 }
 
-/// Reply to a non-blocking poll. When ready, record the event completion as a
-/// sync point; when not ready, leave the host's virtual time untouched (it
-/// charges its own poll cost) and just record its current position.
+/// Reply to a non-blocking poll. The wire payload is `Option<i64>`:
+/// `Some(completion_time)` when the event has completed (recorded as a sync
+/// point), or `None` when not ready (host time left untouched -- it charges its
+/// own poll cost -- and we just record its current position). `curr_time` is
+/// only used for that not-ready bookkeeping.
 fn send_query_response_to(
     host_times: &mut HashMap<HostId, HostTime>,
     host: ResponseId,
-    ready: bool,
-    end_time: i64,
-    event: Option<EventId>,
+    ready: Option<(i64, Option<EventId>)>,
+    curr_time: i64,
 ) {
-    let resp = bincode::serialize(&QueryResponse { ready, end_time }).unwrap();
+    let resp = bincode::serialize(&ready.map(|(end_time, _)| end_time)).unwrap();
     send_response_to(&host, resp);
-    if ready {
-        update_host_sync(host_times, host.host, end_time, event);
-    } else {
-        update_host_curr(host_times, host.host, end_time);
+    match ready {
+        Some((end_time, event)) => update_host_sync(host_times, host.host, end_time, event),
+        None => update_host_curr(host_times, host.host, curr_time),
     }
 }
 
@@ -693,12 +693,20 @@ impl Simulator {
         );
         match last_event {
             Some(event) => match self.queue.query(&event) {
-                Some(time) => {
-                    send_query_response_to(&mut self.host_times, host, true, time, Some(event))
-                }
-                None => send_query_response_to(&mut self.host_times, host, false, curr_time, None),
+                Some(time) => send_query_response_to(
+                    &mut self.host_times,
+                    host,
+                    Some((time, Some(event))),
+                    curr_time,
+                ),
+                None => send_query_response_to(&mut self.host_times, host, None, curr_time),
             },
-            None => send_query_response_to(&mut self.host_times, host, true, curr_time, None),
+            None => send_query_response_to(
+                &mut self.host_times,
+                host,
+                Some((curr_time, None)),
+                curr_time,
+            ),
         }
     }
 
@@ -761,10 +769,13 @@ impl Simulator {
         );
         let event = self.id_of_cuda[&(host.host.clone(), event)];
         match self.queue.query(&event) {
-            Some(time) => {
-                send_query_response_to(&mut self.host_times, host, true, time, Some(event))
-            }
-            None => send_query_response_to(&mut self.host_times, host, false, curr_time, None),
+            Some(time) => send_query_response_to(
+                &mut self.host_times,
+                host,
+                Some((time, Some(event))),
+                curr_time,
+            ),
+            None => send_query_response_to(&mut self.host_times, host, None, curr_time),
         }
     }
 
