@@ -104,12 +104,6 @@ cudaThreadSetCacheConfig(enum cudaFuncCache cacheConfig)
     NOT_IMPLEMENTED;
 }
 
-const char*
-cudaGetErrorName(cudaError_t error)
-{
-    return "cudaErrorUnknown";
-}
-
 cudaError_t
 cudaDeviceGetDefaultMemPool(cudaMemPool_t* memPool, int device)
 {
