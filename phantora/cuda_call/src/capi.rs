@@ -17,6 +17,28 @@ static TIME_OFFSET: AtomicI64 = AtomicI64::new(0); // microseconds
 static INITIAL_CPU_TIME: AtomicI64 = AtomicI64::new(0);
 static INITIAL_SYSTEM_TIME: AtomicI64 = AtomicI64::new(0);
 
+/// Virtual cost (microseconds) charged per non-blocking poll that returns
+/// not-ready while in ignore-cpu-time mode. In that mode virtual time only
+/// advances on sync responses, so a pure poll loop (e.g. ZeRO-3's param-fetch
+/// coordinator) would spin forever on a clock that never moves. Charging a
+/// small cost per poll lets the loop advance time and eventually observe the
+/// event's completion, while keeping the query itself non-blocking so
+/// application control flow that branches on a not-ready event is preserved.
+///
+/// The default (100us) sits on the stable floor: pure spin loops converge to
+/// the event completion time regardless of this constant (polls x cost == the
+/// real wait), so the value only matters for opportunistic polls (e.g. torch's
+/// caching allocator reclaiming blocks). Measured on gpt-oss/DeepSpeed ZeRO-3,
+/// any value up to ~100us gives the same result; larger values (>=1ms) start
+/// phantom-charging the allocator's opportunistic polls and over-count.
+/// Override with PHANTORA_QUERY_POLL_US.
+static QUERY_POLL_US: LazyLock<i64> = LazyLock::new(|| {
+    env::var("PHANTORA_QUERY_POLL_US")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(100)
+});
+
 #[ctor]
 fn initialize_times() {
     INITIAL_CPU_TIME.store(current_cpu_time_us(), Ordering::SeqCst);
@@ -389,13 +411,25 @@ pub extern "C" fn cuda_event_query(
     id: i32,
     time_ref: *mut ffi::c_long,
 ) -> i32 {
+    // Non-blocking poll: the simulator reports whether the event has completed
+    // at the current virtual time, so control flow that branches on a not-ready
+    // event is preserved. If not ready, charge a poll cost (ignore-cpu-time mode
+    // only) so a spin loop advances time instead of deadlocking on a clock that
+    // can't move during a pure poll.
     let resp =
         send_cuda_call_get_response(CudaCall::CudaEventQuery(CudaEvent { device, stream, id }));
+    // Some(completion_time) = complete; None = not ready.
     match bincode::deserialize::<Option<i64>>(&resp).unwrap() {
-        None => 0,
-        Some(time) => {
-            unsafe { *time_ref = time };
+        Some(end_time) => {
+            unsafe { *time_ref = end_time };
             1
+        }
+        None => {
+            if ignore_cpu_time() {
+                TIME_OFFSET.fetch_add(*QUERY_POLL_US, Ordering::SeqCst);
+            }
+            unsafe { *time_ref = get_current_sim_time() };
+            0
         }
     }
 }
@@ -410,9 +444,22 @@ pub extern "C" fn cuda_add_latency(device: i32, stream: i32, latency: i64) {
 
 #[no_mangle]
 pub extern "C" fn cuda_stream_query(device: i32, stream: i32) -> i32 {
+    // See cuda_event_query: non-blocking poll, truthful status, poll cost charged
+    // on not-ready (ignore-cpu-time mode) so a spin loop can make progress.
     let resp =
         send_cuda_call_get_response(CudaCall::CudaStreamQuery(CudaStream { device, id: stream }));
-    bincode::deserialize::<bool>(&resp).unwrap() as i32
+    // Some(completion_time) = complete; None = not ready.
+    if bincode::deserialize::<Option<i64>>(&resp)
+        .unwrap()
+        .is_some()
+    {
+        1
+    } else {
+        if ignore_cpu_time() {
+            TIME_OFFSET.fetch_add(*QUERY_POLL_US, Ordering::SeqCst);
+        }
+        0
+    }
 }
 
 // #[repr(C)]

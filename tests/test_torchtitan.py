@@ -2,14 +2,18 @@ from phantora_utils import (
     disable_function_tracer,
     enable_function_tracer,
     install_phantora_torchtitan_patches,
+    install_phantora_torchtitan_moe_patches,
     time_pair,
 )
 
 install_phantora_torchtitan_patches()
+# Must run before the model is built (the MoE dispatch hook is captured at
+# parallelize time); no-op for dense models / non-MoE runs.
+install_phantora_torchtitan_moe_patches()
 
 import torch
 from torchtitan.tools.logging import init_logger
-from torchtitan.config_manager import ConfigManager
+from torchtitan.config import ConfigManager  # torchtitan >= 0.2.0 (was torchtitan.config_manager)
 from torchtitan.train import Trainer
 
 if __name__ == '__main__':

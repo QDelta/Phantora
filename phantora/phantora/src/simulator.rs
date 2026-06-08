@@ -103,6 +103,25 @@ fn send_sync_response_to(
     update_host_sync(host_times, host.host, end_time, event);
 }
 
+/// Reply to a non-blocking poll. The wire payload is `Option<i64>`:
+/// `Some(completion_time)` when the event has completed (recorded as a sync
+/// point), or `None` when not ready (host time left untouched -- it charges its
+/// own poll cost -- and we just record its current position). `curr_time` is
+/// only used for that not-ready bookkeeping.
+fn send_query_response_to(
+    host_times: &mut HashMap<HostId, HostTime>,
+    host: ResponseId,
+    ready: Option<(i64, Option<EventId>)>,
+    curr_time: i64,
+) {
+    let resp = bincode::serialize(&ready.map(|(end_time, _)| end_time)).unwrap();
+    send_response_to(&host, resp);
+    match ready {
+        Some((end_time, event)) => update_host_sync(host_times, host.host, end_time, event),
+        None => update_host_curr(host_times, host.host, curr_time),
+    }
+}
+
 #[derive(strum::Display, Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ComputeMeta {
     Torch(TorchCall),
@@ -656,25 +675,39 @@ impl Simulator {
     }
 
     fn cuda_stream_query(&mut self, host: ResponseId, curr_time: i64, stream: CudaStream) {
+        // Non-blocking poll on a stream: report whether its last event has
+        // completed at curr_time. See cuda_event_query.
         let key = (host.host.clone(), stream);
-        let stream_completed = match self.stream_info.get_mut(&key) {
+        let last_event = match self.stream_info.get_mut(&key) {
             Some(sinfo) => {
                 Self::clear_compute_buffer_on(&mut self.torch_estimator, sinfo, &mut self.queue);
-                Self::execute_to_time(
-                    &mut self.queue,
-                    &mut self.syncing,
-                    &mut self.host_times,
-                    curr_time,
-                );
-                if let Some(event) = sinfo.events.last() {
-                    self.queue.query(event).is_some()
-                } else {
-                    true
-                }
+                sinfo.events.last().copied()
             }
-            None => true,
+            None => None,
         };
-        send_response_to(&host, bincode::serialize(&stream_completed).unwrap());
+        Self::execute_to_time(
+            &mut self.queue,
+            &mut self.syncing,
+            &mut self.host_times,
+            curr_time,
+        );
+        match last_event {
+            Some(event) => match self.queue.query(&event) {
+                Some(time) => send_query_response_to(
+                    &mut self.host_times,
+                    host,
+                    Some((time, Some(event))),
+                    curr_time,
+                ),
+                None => send_query_response_to(&mut self.host_times, host, None, curr_time),
+            },
+            None => send_query_response_to(
+                &mut self.host_times,
+                host,
+                Some((curr_time, None)),
+                curr_time,
+            ),
+        }
     }
 
     fn cuda_event_record(&mut self, host: ResponseId, curr_time: i64, event: CudaEvent) {
@@ -721,6 +754,13 @@ impl Simulator {
     }
 
     fn cuda_event_query(&mut self, host: ResponseId, curr_time: i64, event: CudaEvent) {
+        // Non-blocking event poll: report whether the event has completed at
+        // curr_time, so application control flow that branches on a not-ready
+        // event (e.g. "if not ready, do other work") is preserved. Under
+        // ignore-cpu-time mode the host charges a poll cost per not-ready reply,
+        // so a pure poll loop still advances virtual time and eventually
+        // observes completion instead of spinning forever on a clock that
+        // cannot move during a poll.
         Self::execute_to_time(
             &mut self.queue,
             &mut self.syncing,
@@ -728,8 +768,15 @@ impl Simulator {
             curr_time,
         );
         let event = self.id_of_cuda[&(host.host.clone(), event)];
-        let resp = self.queue.query(&event);
-        send_response_to(&host, bincode::serialize(&resp).unwrap());
+        match self.queue.query(&event) {
+            Some(time) => send_query_response_to(
+                &mut self.host_times,
+                host,
+                Some((time, Some(event))),
+                curr_time,
+            ),
+            None => send_query_response_to(&mut self.host_times, host, None, curr_time),
+        }
     }
 
     fn cuda_add_latency(

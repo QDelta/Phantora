@@ -1,3 +1,7 @@
+# Llama 3 8B (torchtitan >= 0.2.0 schema).
+# 0.2.0 changes vs 0.1.0: [model] uses hf_assets_path (a dir with a HF tokenizer.json),
+# not tokenizer_path (tiktoken .model); `compile` is its own [compile] section (was
+# [training].compile); [float8] -> [quantize]; [checkpoint].enable (was enable_checkpoint).
 [job]
 dump_folder = "trace"
 description = "Llama 3 8B training"
@@ -10,8 +14,9 @@ log_freq = 1
 enable_tensorboard = false
 
 [model]
+name = "llama3"
 flavor = "8B"
-tokenizer_path = "tests/assets/tokenizer.model"
+hf_assets_path = "tests/assets/hf_tokenizer"
 
 [optimizer]
 name = "AdamW"
@@ -26,7 +31,6 @@ local_batch_size = 2
 seq_len = 8192
 max_norm = 1.0
 steps = 10
-compile = false
 dataset = "c4_test"
 
 [parallelism]
@@ -37,13 +41,11 @@ pipeline_parallel_degree = 1
 context_parallel_degree = 1
 
 [checkpoint]
-enable_checkpoint = false
+enable = false
 
 [activation_checkpoint]
 mode = "selective"
-selective_ac_option = 'op'
+selective_ac_option = "op"
 
-[float8]
-enable_fsdp_float8_all_gather = false
-precompute_float8_dynamic_scale_for_fsdp = false
-filter_fqns = ["output"]
+[compile]
+enable = false

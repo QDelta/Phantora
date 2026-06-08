@@ -494,6 +494,12 @@ cudaEventElapsedTime(float* ms, cudaEvent_t start, cudaEvent_t end)
     return cudaSuccess;
 }
 
+const char*
+cudaGetErrorName(cudaError_t error)
+{
+    return "cudaErrorUnknown";
+}
+
 cudaError_t
 cudaEventQuery(cudaEvent_t event)
 {

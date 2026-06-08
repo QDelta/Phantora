@@ -2,6 +2,7 @@ from phantora_utils import (
     time_pair,
     enable_function_tracer,
     disable_function_tracer,
+    install_phantora_megatron_moe_patches,
 )
 import os
 import functools
@@ -103,16 +104,43 @@ def get_model(
     rotary_base,
     normalization,
     disable_bias_linear,
+    num_moe_experts=None,
+    moe_router_topk=2,
+    moe_token_dispatcher_type="alltoall",
+    expert_model_parallel_size=1,
+    kv_channels=None,
+    qk_layernorm=False,
 ):
+    # MoE config is only added when num_moe_experts is set, so dense models are
+    # unchanged. moe_token_dispatcher_type="alltoall" is what makes Megatron emit
+    # the expert all-to-all (grouped ncclSend/ncclRecv across EP ranks).
+    moe_config_kwargs = {}
+    if num_moe_experts is not None:
+        moe_config_kwargs = dict(
+            num_moe_experts=num_moe_experts,
+            moe_router_topk=moe_router_topk,
+            moe_token_dispatcher_type=moe_token_dispatcher_type,
+            expert_model_parallel_size=expert_model_parallel_size,
+            moe_grouped_gemm=False,
+        )
+
     transformer_config = TransformerConfig(
         tensor_model_parallel_size=tensor_parallel_size,
         pipeline_model_parallel_size=pipeline_model_parallel_size,
         virtual_pipeline_model_parallel_size=virtual_pipeline_model_parallel_size,
+        # Megatron requires sequence parallelism when expert + tensor parallelism
+        # are combined; enable it only in that case so dense / EP=1 runs are unchanged.
+        sequence_parallel=(tensor_parallel_size > 1 and expert_model_parallel_size > 1),
         num_layers=num_layers,
         hidden_size=hidden_size,
         ffn_hidden_size=ffn_hidden_size,
         num_attention_heads=num_attention_heads,
         num_query_groups=num_query_groups,
+        # head_dim; None -> Megatron's default hidden_size // num_attention_heads.
+        # Qwen3 and gpt-oss use head_dim != hidden_size // num_attention_heads.
+        kv_channels=kv_channels,
+        # QK-norm (RMSNorm on Q and K); used by Qwen3. Megatron default is False.
+        qk_layernorm=qk_layernorm,
         gated_linear_unit=swiglu,
         activation_func=torch.nn.functional.silu if swiglu else torch.nn.functional.gelu,
         normalization=normalization,
@@ -123,13 +151,23 @@ def get_model(
         pipeline_dtype=torch.bfloat16,
         attention_backend=AttnBackend.flash,
         recompute_granularity="selective" if recompute_activations else None,
+        **moe_config_kwargs,
     )
+
+    if num_moe_experts is not None:
+        layer_spec = get_gpt_layer_local_spec(
+            num_experts=num_moe_experts,
+            moe_grouped_gemm=False,
+            normalization=normalization,
+        )
+    else:
+        layer_spec = get_gpt_layer_local_spec()
 
     gpt_model = Float16Module(
         transformer_config,
         GPTModel(
             config=transformer_config,
-            transformer_layer_spec=get_gpt_layer_local_spec(),
+            transformer_layer_spec=layer_spec,
             vocab_size=vocab_size,
             max_sequence_length=sequence_length,
             position_embedding_type=position_embedding_type,
@@ -232,6 +270,12 @@ def main(
     rotary_base,
     normalization,
     disable_bias_linear,
+    num_moe_experts=None,
+    moe_router_topk=2,
+    moe_token_dispatcher_type="alltoall",
+    expert_model_parallel_size=1,
+    kv_channels=None,
+    qk_layernorm=False,
 ):
     world_size = int(os.environ["WORLD_SIZE"])
     rank = int(os.environ["RANK"])
@@ -247,8 +291,14 @@ def main(
         tensor_model_parallel_size=tensor_parallel_size,
         pipeline_model_parallel_size=pipeline_model_parallel_size,
         virtual_pipeline_model_parallel_size=virtual_pipeline_model_parallel_size,
+        expert_model_parallel_size=expert_model_parallel_size,
         create_gloo_process_groups=False,
     )
+
+    if num_moe_experts is not None:
+        # Make MoE survive payload-free simulation: TE-absence shim + load-balanced
+        # routing so the dispatch/all-to-all sizes are well-defined and uniform.
+        install_phantora_megatron_moe_patches()
 
     model_parallel_cuda_manual_seed(42)
 
@@ -271,6 +321,12 @@ def main(
             rotary_base,
             normalization,
             disable_bias_linear,
+            num_moe_experts=num_moe_experts,
+            moe_router_topk=moe_router_topk,
+            moe_token_dispatcher_type=moe_token_dispatcher_type,
+            expert_model_parallel_size=expert_model_parallel_size,
+            kv_channels=kv_channels,
+            qk_layernorm=qk_layernorm,
         )
         model = model.to(device)
         model.train()
@@ -296,6 +352,12 @@ def main(
                 rotary_base,
                 normalization,
                 disable_bias_linear,
+                num_moe_experts=num_moe_experts,
+                moe_router_topk=moe_router_topk,
+                moe_token_dispatcher_type=moe_token_dispatcher_type,
+                expert_model_parallel_size=expert_model_parallel_size,
+                kv_channels=kv_channels,
+                qk_layernorm=qk_layernorm,
             )
             model_chunk = model_chunk.to(device)
             model_chunk.train()
@@ -408,6 +470,18 @@ if __name__ == "__main__":
         choices=["LayerNorm", "RMSNorm"])
     parser.add_argument("--disable_bias_linear", action="store_true",
         help="Set `add_bias_linear=False` (Megatron default is True).")
+    # MoE knobs (names mirror Megatron's TransformerConfig). num_moe_experts=None => dense.
+    parser.add_argument("--num_moe_experts", type=int, default=None,
+        help="Number of routed experts (None = dense, no MoE).")
+    parser.add_argument("--moe_router_topk", type=int, default=2)
+    parser.add_argument("--moe_token_dispatcher_type", type=str, default="alltoall",
+        choices=["allgather", "alltoall"])
+    parser.add_argument("--expert_model_parallel_size", type=int, default=1)
+    parser.add_argument("--kv_channels", type=int, default=None,
+        help="Attention head_dim; None = hidden_size // num_attention_heads. "
+             "Qwen3 and gpt-oss set this explicitly.")
+    parser.add_argument("--qk_layernorm", action="store_true",
+        help="Apply RMSNorm to Q and K (QK-norm); used by Qwen3.")
     args = parser.parse_args()
 
     enable_function_tracer()
@@ -431,5 +505,11 @@ if __name__ == "__main__":
         rotary_base=args.rotary_base,
         normalization=args.normalization,
         disable_bias_linear=args.disable_bias_linear,
+        num_moe_experts=args.num_moe_experts,
+        moe_router_topk=args.moe_router_topk,
+        moe_token_dispatcher_type=args.moe_token_dispatcher_type,
+        expert_model_parallel_size=args.expert_model_parallel_size,
+        kv_channels=args.kv_channels,
+        qk_layernorm=args.qk_layernorm,
     )
     disable_function_tracer()

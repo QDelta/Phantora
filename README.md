@@ -17,57 +17,36 @@ You add a few lines to your training script to enable the Phantora tracer, then 
 
 The framework's own logging then emits the metrics it would on a real cluster — produced from a single GPU and a virtual cluster configuration of your choosing.
 
-## Limitations
+## What Phantora can simulate
 
-### Control flow must be data-independent
+Phantora runs your **unmodified** Megatron-LM, DeepSpeed, or TorchTitan training script and estimates how it would perform on a virtual cluster you describe — any GPU count, per-GPU VRAM, and network topology — all from a single GPU.
 
-Phantora simulates GPU computation and communication, but the tensor values produced by simulated kernels are arbitrary. **Your training script's control flow must therefore not depend on the contents of GPU tensors.** Any branch that reads a value out of a tensor — for example, an early-exit on a loss threshold, a gradient-norm check, or a NaN/inf rescue path — will see garbage data and may follow a path that does not match real execution. Loss values printed during simulation are also not meaningful.
+### Available model presets
 
-Concretely:
+Ready-to-run presets ship for each framework. `✅` links to the preset — a launcher script for Megatron/DeepSpeed (under `tests/docker/<framework>/`), or a `.toml` config for TorchTitan; `—` means there is no preset for that pair (the model may still be expressible by hand). All MoE presets assume **load-balanced experts** ([why](#control-flow-must-be-data-independent)).
 
-- **Megatron**: gradient clipping must be disabled. It copies a norm to CPU and takes a `sqrt`, which can fault on the random GPU memory contents under simulation.
-- Avoid early-stopping logic or NaN/inf rescue paths in the iterations being simulated.
-- Stick to control flow that depends only on hyperparameters, iteration counts, and configuration. This covers the common case in LLM pre-training.
+| Model | Megatron | DeepSpeed | TorchTitan |
+| --- | :---: | :---: | :---: |
+| **Dense** | | | |
+| Llama2 7B | [✅](tests/docker/megatron/llama/run_llama2_7b.sh) | [✅](tests/docker/deepspeed/llama/run_llama2_7b.sh) | — |
+| Llama2 13B | [✅](tests/docker/megatron/llama/run_llama2_13b.sh) | [✅](tests/docker/deepspeed/llama/run_llama2_13b.sh) | — |
+| Llama2 70B | [✅](tests/docker/megatron/llama/run_llama2_70b.sh) | [✅](tests/docker/deepspeed/llama/run_llama2_70b.sh) | — |
+| Llama3 8B | [✅](tests/docker/megatron/llama/run_llama3_8b.sh) | [✅](tests/docker/deepspeed/llama/run_llama3_8b.sh) | [✅](tests/docker/torchtitan/llama3/run_llama3_8b.sh) |
+| Llama3 70B | [✅](tests/docker/megatron/llama/run_llama3_70b.sh) | [✅](tests/docker/deepspeed/llama/run_llama3_70b.sh) | — |
+| **MoE** | | | |
+| Mixtral 8×7B | [✅](tests/docker/megatron/mixtral/run_mixtral_8x7b.sh) | — | — |
+| gpt-oss 20B | — | [✅](tests/docker/deepspeed/gpt_oss/run_gpt_oss_20b.sh) | — |
+| Qwen3 30B-A3B | [✅](tests/docker/megatron/qwen3/run_qwen3_30b_a3b.sh) | — | [✅](tests/test_torchtitan_qwen3_moe.toml) ¹ |
 
-### Limited NCCL coverage
+1. TorchTitan flavors are fixed-size; run with `--training.debug_moe_force_load_balance`. The full 30B-A3B flavor targets a real multi-GPU cluster; for a quick check on a modest box, add `--model.flavor=debugmodel_moe`.
 
-Phantora ships a stub `libnccl.so` that intercepts NCCL calls and forwards them to the simulator. Only a subset of the NCCL API is currently implemented — calling an unsupported entry point will abort with `NOT_IMPLEMENTED`.
+See [Try our examples](#try-our-examples) for how to launch one.
 
-**Collective and point-to-point operations**
+### Parallelism support
 
-| NCCL op | Status |
-| --- | --- |
-| `ncclAllReduce` | ✅ Supported |
-| `ncclAllGather` | ✅ Supported |
-| `ncclReduceScatter` | ✅ Supported |
-| `ncclBcast` (legacy in-place API) | ✅ Supported |
-| `ncclBroadcast` | ❌ Not implemented |
-| `ncclReduce` | ❌ Not implemented |
-| `ncclSend` (point-to-point) | ✅ Supported |
-| `ncclRecv` (point-to-point) | ✅ Supported |
+The strategies Phantora models today, which **compose** (e.g. TP+EP with sequence parallelism, or DP+PP):
 
-
-**Communicator, group, and utility calls**
-
-| NCCL op | Status |
-| --- | --- |
-| `ncclCommInitRank`, `ncclCommInitRankConfig`, `ncclCommInitRankScalable` | ✅ Supported |
-| `ncclCommInitAll` | ✅ Supported |
-| `ncclCommSplit` | ✅ Supported |
-| `ncclCommDestroy`, `ncclCommAbort`, `ncclCommFinalize` | ✅ Supported |
-| `ncclCommRegister`, `ncclCommDeregister` | ✅ Supported (no-op) |
-| `ncclGroupStart`, `ncclGroupEnd` | ✅ Supported |
-| `ncclGetUniqueId`, `ncclGetVersion`, `ncclGetErrorString`, `ncclGetLastError`, `ncclCommGetAsyncError` | ✅ Supported |
-| `ncclCommCount`, `ncclCommCuDevice`, `ncclCommUserRank` | ❌ Not implemented |
-| `ncclRedOpCreatePreMulSum`, `ncclRedOpDestroy` | ❌ Not implemented |
-
-The full set of stubs lives in [`stub/nccl.c`](stub/nccl.c). Pull requests to expand NCCL coverage are very welcome.
-
-### Framework feature support
-
-The matrix below summarises which features of each supported framework Phantora can simulate today. A 🚧 row maps to an unsupported API, missing communication semantics, or a separate communication library that Phantora does not yet intercept.
-
-| Feature | Megatron | DeepSpeed | TorchTitan | Required collective(s) |
+| Strategy | Megatron | DeepSpeed | TorchTitan | Required collective(s) |
 | --- | :---: | :---: | :---: | --- |
 | Data parallelism (DP) | ✅ | ✅ | ✅ | AllReduce |
 | Tensor parallelism (TP) | ✅ | ✅ | ✅ | AllReduce, AllGather, ReduceScatter |
@@ -75,14 +54,11 @@ The matrix below summarises which features of each supported framework Phantora 
 | FSDP / FSDP2 | — | — | ✅ | AllGather, ReduceScatter |
 | Activation checkpointing | ✅ | ✅ | ✅ | (no extra communication) |
 | Pipeline parallelism (PP) | ✅ | ✅ | ✅ | `ncclSend` / `ncclRecv` |
-| Expert parallelism / MoE | 🚧 | 🚧 | 🚧 | All-to-all via grouped `ncclSend` / `ncclRecv`, payload/routing semantics, and/or [DeepEP](https://github.com/deepseek-ai/DeepEP) |
+| Expert parallelism / MoE | ✅¹ | ✅¹ | ✅¹ | All-to-all via grouped `ncclSend` / `ncclRecv` |
 
-Important limitations remain:
+`✅` = simulated end-to-end; `—` = the strategy does not exist in that framework. ¹ MoE is supported under a **load-balanced-experts** assumption (see [Limitations](#limitations)).
 
-- **Payload-free NCCL simulation.** Phantora models the timing and ordering of point-to-point transfers, but it does not transfer bytes between ranks. Framework paths that inspect activation values or other transferred tensor payloads need to use a CPU backend path for now.
-- **DeepEP — on the roadmap.** Some recent MoE training stacks (e.g., DeepSeek-style models) bypass NCCL entirely and use [DeepEP](https://github.com/deepseek-ai/DeepEP) for expert dispatch/combine. We plan to add a DeepEP interception layer so those stacks can be simulated as well.
-
-Rows marked `—` mean the feature does not exist in that framework. If you'd like to help land any of the in-progress pieces sooner, contributions are very welcome — see [Contributing](#contributing).
+Phantora's estimates have been **validated against real-hardware ground truth** to within a few percent — see [Accuracy: Validated Configurations](#accuracy-validated-configurations).
 
 ## Requirements
 
@@ -138,9 +114,9 @@ python3 config_gen.py --nhost 4 --ngpu 4 --vram_mib 143771
 
 Similar for DeepSpeed and TorchTitan.
 
-For TorchTitan, the `tokenizer.model` of Llama3 is needed, you can get it from its [huggingface repo](https://huggingface.co/meta-llama/Meta-Llama-3-8B-Instruct/blob/main/original/tokenizer.model). Place `tokenizer.model` in `tests/assets` before starting.
+TorchTitan (≥ 0.2.0) loads a Hugging Face tokenizer **directory** (`tokenizer.json` + config) via `hf_assets_path`, not a tiktoken `.model` file. Place any HF tokenizer in `tests/assets/hf_tokenizer/` before starting — under payload-free simulation only its vocab size matters (it sets the embedding dimensions). The Llama3 tokenizer works, or any ungated one (e.g. `openai-community/gpt2`).
 
-`run.sh` will pass its arguments to the corresponding scripts (`tests/test_{megatron,deepspeed,torchtitan}.py`)
+`run.sh` will pass its arguments to the corresponding scripts (`tests/test_{megatron,deepspeed,torchtitan}.py`). Each entry in the [model-preset table](#available-model-presets) links to a ready-made launcher you can run this way.
 
 ## Adapt your training scripts
 
@@ -235,6 +211,60 @@ If you can run any of the supported frameworks (Megatron, DeepSpeed, TorchTitan)
 - **Versions**: Phantora commit hash, PyTorch version, framework version
 
 We especially welcome data points that fall outside what is covered above — different GPUs (e.g., MI300X, B200, GB200), interconnects (RoCE, different InfiniBand speeds, multi-rail), parallelism strategies, models, sequence lengths, or training optimizations.
+
+## Limitations
+
+### Control flow must be data-independent
+
+Phantora simulates GPU computation and communication, but the tensor values produced by simulated kernels are arbitrary. **Your training script's control flow must therefore not depend on the contents of GPU tensors.** Any branch that reads a value out of a tensor — for example, an early-exit on a loss threshold, a gradient-norm check, or a NaN/inf rescue path — will see garbage data and may follow a path that does not match real execution. Loss values printed during simulation are also not meaningful.
+
+Concretely:
+
+- **Megatron**: gradient clipping must be disabled. It copies a norm to CPU and takes a `sqrt`, which can fault on the random GPU memory contents under simulation.
+- **MoE routing** is inherently data-dependent: the router picks experts from logits, and the dispatch counts / all-to-all split sizes / permutation indices all follow from that choice. Under simulation those are garbage, so Phantora's MoE support assumes **load-balanced experts** and makes the dispatch *shapes* analytic and uniform instead (see [Payload-free NCCL simulation](#payload-free-nccl-simulation) below). Don't rely on simulated routing decisions or per-expert token counts being realistic.
+- Avoid early-stopping logic or NaN/inf rescue paths in the iterations being simulated.
+- Stick to control flow that depends only on hyperparameters, iteration counts, and configuration. This covers the common case in LLM pre-training.
+
+### Payload-free NCCL simulation
+
+Phantora models the timing and ordering of point-to-point transfers, but it does not transfer bytes between ranks. Framework paths that inspect activation values or other transferred tensor payloads need to use a CPU backend path for now. Two consequences worth calling out:
+
+- **MoE assumes load-balanced experts.** Because expert routing reads garbage tensor values (see [Control flow must be data-independent](#control-flow-must-be-data-independent)), Phantora's framework shims in [`tests/phantora_utils.py`](tests/phantora_utils.py) replace the data-dependent dispatch sizing with the analytic *uniform* distribution: every expert receives an equal share of tokens. The expert all-to-all itself is still simulated, so this gives a faithful throughput/MFU estimate for a balanced workload, but it does not model routing imbalance, capacity overflow, or token dropping. Covered today: Megatron (EP, and TP+EP with sequence parallelism), DeepSpeed (the Hugging Face gpt-oss architecture, whose experts run locally per rank under DP/ZeRO), and TorchTitan (qwen3 expert parallelism).
+- **DeepEP — on the roadmap.** Some recent MoE training stacks (e.g., DeepSeek-style models) bypass NCCL entirely and use [DeepEP](https://github.com/deepseek-ai/DeepEP) for expert dispatch/combine. We plan to add a DeepEP interception layer so those stacks can be simulated as well.
+
+### Limited NCCL coverage
+
+Phantora ships a stub `libnccl.so` that intercepts NCCL calls and forwards them to the simulator. Only a subset of the NCCL API is currently implemented — calling an unsupported entry point will abort with `NOT_IMPLEMENTED`.
+
+**Collective and point-to-point operations**
+
+| NCCL op | Status |
+| --- | --- |
+| `ncclAllReduce` | ✅ Supported |
+| `ncclAllGather` | ✅ Supported |
+| `ncclReduceScatter` | ✅ Supported |
+| `ncclBcast` (legacy in-place API) | ✅ Supported |
+| `ncclBroadcast` | ❌ Not implemented |
+| `ncclReduce` | ❌ Not implemented |
+| `ncclSend` (point-to-point) | ✅ Supported |
+| `ncclRecv` (point-to-point) | ✅ Supported |
+
+
+**Communicator, group, and utility calls**
+
+| NCCL op | Status |
+| --- | --- |
+| `ncclCommInitRank`, `ncclCommInitRankConfig`, `ncclCommInitRankScalable` | ✅ Supported |
+| `ncclCommInitAll` | ✅ Supported |
+| `ncclCommSplit` | ✅ Supported |
+| `ncclCommDestroy`, `ncclCommAbort`, `ncclCommFinalize` | ✅ Supported |
+| `ncclCommRegister`, `ncclCommDeregister` | ✅ Supported (no-op) |
+| `ncclGroupStart`, `ncclGroupEnd` | ✅ Supported |
+| `ncclGetUniqueId`, `ncclGetVersion`, `ncclGetErrorString`, `ncclGetLastError`, `ncclCommGetAsyncError` | ✅ Supported |
+| `ncclCommCount`, `ncclCommCuDevice`, `ncclCommUserRank` | ✅ Supported |
+| `ncclRedOpCreatePreMulSum`, `ncclRedOpDestroy` | ✅ Supported (PreMulSum modeled as sum) |
+
+The full set of stubs lives in [`stub/nccl.c`](stub/nccl.c). Pull requests to expand NCCL coverage are very welcome.
 
 ## Contributing
 
