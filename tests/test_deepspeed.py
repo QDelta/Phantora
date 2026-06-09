@@ -83,10 +83,18 @@ def build_pipeline_model(args: argparse.Namespace) -> PipelineModule:
         attn_implementation="eager",
     )
 
+    from transformers.modeling_utils import no_init_weights
+
     dtype_orig = torch.get_default_dtype()
     torch.set_default_dtype(torch.bfloat16)
     try:
-        llama = LlamaForCausalLM(config)
+        # Skip HF weight init (same as build_gpt_oss): under Phantora kernels
+        # never execute and tensor values are garbage, so per-parameter init is
+        # wasted CPU work. It also lets the empty, identically-shaped params share
+        # storage under Phantora's parameter sharing, so each rank doesn't
+        # materialize a full model copy in host RAM during 8-way construction.
+        with no_init_weights():
+            llama = LlamaForCausalLM(config)
     finally:
         torch.set_default_dtype(dtype_orig)
     if args.tensor_parallel_size > 1:
