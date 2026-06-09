@@ -20,7 +20,15 @@ pub struct Args {
     pub available_cores: Option<std::vec::Vec<usize>>,
 
     /// disable sequence of calls optimization
-    #[arg(long, action = clap::ArgAction::SetTrue)]
+    // Accept both spellings: clap's `long` default would kebab-case the field to
+    // `--disable-sequence-call`, but the natural/documented spelling is the
+    // underscore form. Make the underscore canonical and alias the kebab so
+    // neither is rejected as an unexpected argument.
+    #[arg(
+        long = "disable_sequence_call",
+        alias = "disable-sequence-call",
+        action = clap::ArgAction::SetTrue
+    )]
     pub disable_sequence_call: bool,
 
     /// Replay kernel timings from a performance database directory instead of
