@@ -38,6 +38,33 @@ DTYPE = {
     "BFloat16": torch.bfloat16,
 }
 
+# Compact-tensor dtype code -> Kind name. Mirrors DTYPE_CODES in
+# phantora/phantora/src/perf_db.rs; keep the two in sync.
+CODE_TO_KIND = {
+    "f32": "Float", "f64": "Double", "f16": "Half", "bf16": "BFloat16",
+    "b8": "Bool", "i32": "Int", "i64": "Int64", "i16": "Int16",
+    "i8": "Int8", "u8": "Uint8",
+}
+
+
+def expand(v):
+    """Inverse of perf_db.rs `compact_value`: a compact tensor `[code,[dims]]`
+    -> `{shape,dtype}`, and `{"R":[k,[period]]}` -> the period repeated k times.
+    Leaves the legacy verbose `{shape,dtype}` form untouched."""
+    if isinstance(v, dict):
+        if len(v) == 1 and isinstance(v.get("R"), list) and len(v["R"]) == 2:
+            k, period = v["R"]
+            out = []
+            for _ in range(k):
+                out.extend(expand(e) for e in period)
+            return out
+        return {kk: expand(val) for kk, val in v.items()}
+    if isinstance(v, list):
+        if len(v) == 2 and isinstance(v[0], str) and v[0] in CODE_TO_KIND and isinstance(v[1], list):
+            return {"shape": v[1], "dtype": CODE_TO_KIND[v[0]]}
+        return [expand(e) for e in v]
+    return v
+
 
 # Per-op allocation cache keyed by (numel, dtype), mirroring torch_estimate.rs's
 # `allocate`/`tensor_cache`: within one op, operands of the same size+dtype reuse
@@ -259,16 +286,24 @@ def main():
                         rows[tuple(row[:nkey])] = row
         return rows
 
-    # compute.csv (key columns: op, key). With --merge, start from the existing
-    # out DB and overlay the profiled keys; otherwise write a fresh table.
+    # compute.csv (columns: key, nanos; key = compacted TorchCallInfo JSON, op is
+    # its single outer key). With --merge, start from the existing out DB and
+    # overlay the profiled keys; otherwise write a fresh table. The original
+    # (compact) key string is carried through verbatim, so no Python compaction
+    # is needed -- only expand() to reconstruct tensors for profiling.
     compute_out = os.path.join(out, "compute.csv")
-    rows = load_existing(compute_out, 2) if args.merge else {}
+    rows = load_existing(compute_out, 1) if args.merge else {}
     n_ok = n_skip = 0
     with open(os.path.join(args.ref, "compute.csv")) as f:
         r = csv.reader(f); next(r)
-        for op, key, ref_nanos in r:
+        for row in r:
+            if not row:
+                continue
+            key, ref_nanos = row[0], row[1]
+            obj = json.loads(key)
+            op = next(iter(obj))
             try:
-                thunk = build(op, json.loads(key)[op])
+                thunk = build(op, expand(obj[op]))
                 if thunk is None:
                     raise NotImplementedError(op)
                 nanos = timer(thunk, args.warmup, args.iters)
@@ -277,9 +312,9 @@ def main():
                 nanos = int(ref_nanos)
                 n_skip += 1
                 print(f"  WARN {op}: {type(e).__name__}: {str(e)[:80]} -> kept reference time", file=sys.stderr)
-            rows[(op, key)] = [op, key, nanos]
+            rows[(key,)] = [key, nanos]
     with open(compute_out, "w", newline="") as g:
-        w = csv.writer(g); w.writerow(["op", "key", "nanos"])
+        w = csv.writer(g); w.writerow(["key", "nanos"])
         for row in sorted(rows.values()):
             w.writerow(row)
     print(f"compute.csv: {n_ok} profiled, {n_skip} carried-over, {len(rows)} total")

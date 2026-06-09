@@ -7,9 +7,12 @@
 //!
 //! On disk the DB is a directory of CSV files (one per timing table) plus a
 //! `manifest.md`. CSV is used so the committed DB renders as a table and diffs
-//! cleanly on GitHub. The `compute.csv` `key` column is the exact `TorchCallInfo`
-//! serialized as JSON (round-trips losslessly via serde); the leading `op`
-//! column is the variant name for quick human scanning.
+//! cleanly on GitHub. The `compute.csv` `key` column is the `TorchCallInfo`
+//! serialized as JSON, then compacted (see `compact_value`): tensor objects
+//! `{shape,dtype}` become `[code,[dims]]`, and runs of identical tensors in a
+//! list collapse to `{"R":[k,[period]]}`. It still round-trips losslessly via
+//! serde, and stays plain JSON so the Python `bench.py` reads it with the stdlib
+//! (it applies the same expand). `load` also accepts the older verbose form.
 
 use std::collections::{BTreeMap, HashMap};
 use std::error::Error;
@@ -19,6 +22,7 @@ use std::time::Duration;
 
 use cuda_call::CudaMemcpyKind;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::torch_call::TorchCallInfo;
 
@@ -74,6 +78,117 @@ fn memcpy_kind_from_str(s: &str) -> Option<CudaMemcpyKind> {
     })
 }
 
+/// `tch::Kind` serialized name <-> short code used by the compact tensor form
+/// `[code,[dims]]`. Tensors whose dtype is not listed here keep the verbose
+/// `{shape,dtype}` object, so the mapping stays bijective and round-trips.
+const DTYPE_CODES: &[(&str, &str)] = &[
+    ("Float", "f32"),
+    ("Double", "f64"),
+    ("Half", "f16"),
+    ("BFloat16", "bf16"),
+    ("Bool", "b8"),
+    ("Int", "i32"),
+    ("Int64", "i64"),
+    ("Int16", "i16"),
+    ("Int8", "i8"),
+    ("Uint8", "u8"),
+];
+
+fn dtype_to_code(name: &str) -> Option<&'static str> {
+    DTYPE_CODES.iter().find(|(n, _)| *n == name).map(|(_, c)| *c)
+}
+
+fn dtype_from_code(code: &str) -> Option<&'static str> {
+    DTYPE_CODES.iter().find(|(_, c)| *c == code).map(|(n, _)| *n)
+}
+
+/// If `items` is a single period repeated k>1 times, return `(k, period)`.
+fn find_period(items: &[Value]) -> Option<(usize, Vec<Value>)> {
+    let n = items.len();
+    for p in 1..=n / 2 {
+        if n % p == 0 && (0..n).all(|i| items[i] == items[i % p]) {
+            return Some((n / p, items[..p].to_vec()));
+        }
+    }
+    None
+}
+
+/// Compact a `TorchCallInfo` JSON value for storage. Lossless; `expand_value`
+/// inverts it. Two shorthands: a tensor object `{"shape":S,"dtype":"Float"}`
+/// becomes `["f32",S]`, and an all-tensor list that is a repeated period becomes
+/// `{"R":[k,[period]]}` (the foreach optimizer ops list 1000s of tensors with a
+/// tiny period). Note: relies on no `TorchCallInfo` variant producing a 2-tuple
+/// `[<string>, <array>]` body (it would alias a compact tensor) -- guarded by the
+/// round-trip test.
+fn compact_value(v: Value) -> Value {
+    match v {
+        Value::Object(map) => {
+            if map.len() == 2 {
+                if let (Some(shape @ Value::Array(_)), Some(Value::String(dt))) =
+                    (map.get("shape"), map.get("dtype"))
+                {
+                    if let Some(code) = dtype_to_code(dt) {
+                        return Value::Array(vec![Value::String(code.to_string()), shape.clone()]);
+                    }
+                }
+            }
+            Value::Object(map.into_iter().map(|(k, val)| (k, compact_value(val))).collect())
+        }
+        Value::Array(arr) => {
+            let items: Vec<Value> = arr.into_iter().map(compact_value).collect();
+            let all_tensors = items.len() > 1
+                && items.iter().all(|it| {
+                    matches!(it, Value::Array(a) if a.len() == 2 && a[0].is_string() && a[1].is_array())
+                });
+            if all_tensors {
+                if let Some((k, period)) = find_period(&items) {
+                    return serde_json::json!({ "R": [k, period] });
+                }
+            }
+            Value::Array(items)
+        }
+        other => other,
+    }
+}
+
+/// Inverse of `compact_value`. Also tolerates the legacy verbose form (an old
+/// committed DB whose tensors are still `{shape,dtype}` objects loads unchanged).
+fn expand_value(v: Value) -> Value {
+    match v {
+        Value::Object(map) => {
+            if map.len() == 1 {
+                if let Some(Value::Array(rarr)) = map.get("R") {
+                    if let (Some(k), Some(period)) =
+                        (rarr.first().and_then(Value::as_u64), rarr.get(1).and_then(Value::as_array))
+                    {
+                        let mut out = Vec::with_capacity(k as usize * period.len());
+                        for _ in 0..k {
+                            for e in period {
+                                out.push(expand_value(e.clone()));
+                            }
+                        }
+                        return Value::Array(out);
+                    }
+                }
+            }
+            Value::Object(map.into_iter().map(|(k, val)| (k, expand_value(val))).collect())
+        }
+        Value::Array(arr) => {
+            let tensor_dtype = if arr.len() == 2 && arr[1].is_array() {
+                arr[0].as_str().and_then(dtype_from_code)
+            } else {
+                None
+            };
+            if let Some(name) = tensor_dtype {
+                let shape = arr.into_iter().nth(1).unwrap();
+                return serde_json::json!({ "shape": shape, "dtype": name });
+            }
+            Value::Array(arr.into_iter().map(expand_value).collect())
+        }
+        other => other,
+    }
+}
+
 impl PerfDb {
     /// Load a DB from `dir`. Missing table files are treated as empty; a missing
     /// directory is an error (the caller asked to replay a non-existent DB).
@@ -88,9 +203,15 @@ impl PerfDb {
             let mut r = csv::Reader::from_path(&compute_path)?;
             for rec in r.records() {
                 let rec = rec?;
-                // columns: op, key, nanos
-                let key: TorchCallInfo = serde_json::from_str(&rec[1])?;
-                db.compute.insert(key, Duration::from_nanos(rec[2].parse()?));
+                // New layout: key,nanos. Legacy layout: op,key,nanos.
+                let (key_str, nanos_str) = if rec.len() >= 3 {
+                    (&rec[1], &rec[2])
+                } else {
+                    (&rec[0], &rec[1])
+                };
+                let value: Value = serde_json::from_str(key_str)?;
+                let key: TorchCallInfo = serde_json::from_value(expand_value(value))?;
+                db.compute.insert(key, Duration::from_nanos(nanos_str.parse()?));
             }
         }
 
@@ -164,18 +285,21 @@ impl PerfDb {
     pub fn save(&self, dir: &Path) -> Result<(), Box<dyn Error>> {
         fs::create_dir_all(dir)?;
 
-        // compute.csv
+        // compute.csv (key = compacted TorchCallInfo JSON; see compact_value)
         {
             let mut w = csv::Writer::from_path(dir.join("compute.csv"))?;
-            w.write_record(["op", "key", "nanos"])?;
-            let mut rows: Vec<(String, String, u128)> = self
+            w.write_record(["key", "nanos"])?;
+            let mut rows: Vec<(String, u128)> = self
                 .compute
                 .iter()
-                .map(|(k, v)| (k.to_string(), serde_json::to_string(k).unwrap(), v.as_nanos()))
+                .map(|(k, v)| {
+                    let compact = compact_value(serde_json::to_value(k).unwrap());
+                    (serde_json::to_string(&compact).unwrap(), v.as_nanos())
+                })
                 .collect();
             rows.sort(); // stable, diff-friendly ordering
-            for (op, key, nanos) in rows {
-                w.write_record([op, key, nanos.to_string()])?;
+            for (key, nanos) in rows {
+                w.write_record([key, nanos.to_string()])?;
             }
             w.flush()?;
         }
@@ -280,7 +404,8 @@ impl PerfDb {
              - **flash_attn entries:** {}\n\n\
              Recorded with `--record-perf-db <dir>`. Replay with `--perf-db <dir>` (no GPU \
              required). Each `*.csv` is one timing table (values in nanoseconds); the \
-             `compute.csv` `key` column is the exact `TorchCallInfo` as JSON.\n",
+             `compute.csv` `key` is the `TorchCallInfo` as compacted JSON (tensors \
+             as `[code,[dims]]`, repeated-tensor lists as `{{\"R\":[k,[period]]}}`).\n",
             self.gpu_name,
             SCHEMA_VERSION,
             self.compute.len(),
@@ -340,6 +465,22 @@ mod tests {
             Duration::from_nanos(9_000),
         );
 
+        // Foreach op: interleaved periodic tensor lists exercise the {"R":...}
+        // run-length shorthand and must round-trip in exact order.
+        db.compute.insert(
+            TorchCallInfo::ForeachAddCMul_(
+                vec![
+                    ti(&[1572864], Kind::Float),
+                    ti(&[3145728], Kind::Float),
+                    ti(&[1572864], Kind::Float),
+                    ti(&[3145728], Kind::Float),
+                ],
+                vec![ti(&[1572864], Kind::Float), ti(&[3145728], Kind::Float)],
+                vec![ti(&[16], Kind::Float)],
+            ),
+            Duration::from_nanos(28_800),
+        );
+
         db.memcpy
             .insert((CudaMemcpyKind::HostToDevice, 1_048_576), Duration::from_nanos(45_600));
         db.memcpy
@@ -378,5 +519,23 @@ mod tests {
         assert_eq!(loaded.memcpy, db.memcpy);
         assert_eq!(loaded.flash_attn, db.flash_attn);
         assert_eq!(loaded.sequence, db.sequence);
+    }
+
+    // Re-save an existing DB through the current codec (e.g. to migrate it to a
+    // new compact format) and verify it reloads identically. Ignored by default;
+    // run with `PERFDB_DIR=<dir> cargo test -p phantora migrate_perf_db -- --ignored`.
+    #[test]
+    #[ignore]
+    fn migrate_perf_db() {
+        let dir = std::path::PathBuf::from(std::env::var("PERFDB_DIR").expect("set PERFDB_DIR"));
+        let before = PerfDb::load(&dir).expect("load");
+        before.save(&dir).expect("save");
+        let after = PerfDb::load(&dir).expect("reload");
+        assert_eq!(before.compute, after.compute);
+        assert_eq!(before.memcpy, after.memcpy);
+        assert_eq!(before.flash_attn, after.flash_attn);
+        assert_eq!(before.sequence, after.sequence);
+        assert_eq!(before.gpu_name, after.gpu_name);
+        eprintln!("migrated {} compute entries in {}", after.compute.len(), dir.display());
     }
 }
