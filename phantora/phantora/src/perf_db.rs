@@ -196,9 +196,14 @@ impl PerfDb {
             w.flush()?;
         }
 
-        // flash_attn.csv
-        {
-            let mut w = csv::Writer::from_path(dir.join("flash_attn.csv"))?;
+        // flash_attn.csv (omitted entirely when empty -- e.g. presets whose
+        // attention is simulated via ordinary compute ops; load() tolerates the
+        // missing file. Remove any stale copy so a re-record cleans up.)
+        let flash_path = dir.join("flash_attn.csv");
+        if self.flash_attn.is_empty() {
+            let _ = fs::remove_file(&flash_path);
+        } else {
+            let mut w = csv::Writer::from_path(&flash_path)?;
             w.write_record([
                 "is_fwd",
                 "is_bf16",
@@ -244,9 +249,14 @@ impl PerfDb {
             w.flush()?;
         }
 
-        // sequence.csv
-        {
-            let mut w = csv::Writer::from_path(dir.join("sequence.csv"))?;
+        // sequence.csv (omitted entirely when empty -- perf-db modes force
+        // single-op timing, so it is empty for the recorded presets; load()
+        // tolerates the missing file. Remove any stale copy.)
+        let seq_path = dir.join("sequence.csv");
+        if self.sequence.is_empty() {
+            let _ = fs::remove_file(&seq_path);
+        } else {
+            let mut w = csv::Writer::from_path(&seq_path)?;
             w.write_record(["seq_hash", "nanos"])?;
             for (hash, durs) in &self.sequence {
                 let nanos = durs
