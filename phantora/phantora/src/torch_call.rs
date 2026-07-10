@@ -776,7 +776,8 @@ impl TorchCallMsg {
                 }
             },
             "aten::scaled_dot_product_attention" => match self.args.as_slice() {
-                [Tensor(shape1, kind1, _), Tensor(shape2, kind2, _), Tensor(shape3, kind3, _), _, Bool(causal), Bool(gqa)] => {
+                [Tensor(shape1, kind1, _), Tensor(shape2, kind2, _), Tensor(shape3, kind3, _), Tensor(mask_shape, mask_kind, _), Double(_), Bool(causal), Double(_), Bool(gqa)]
+                | [Tensor(shape1, kind1, _), Tensor(shape2, kind2, _), Tensor(shape3, kind3, _), Tensor(mask_shape, mask_kind, _), Double(_), Bool(causal), Bool(gqa)] => {
                     Some(TorchCallInfo::SDPA {
                         q: TensorInfo {
                             shape: shape1.clone(),
@@ -790,6 +791,30 @@ impl TorchCallMsg {
                             shape: shape3.clone(),
                             dtype: *kind3,
                         },
+                        mask: Some(TensorInfo {
+                            shape: mask_shape.clone(),
+                            dtype: *mask_kind,
+                        }),
+                        causal: *causal,
+                        gqa: *gqa,
+                    })
+                }
+                [Tensor(shape1, kind1, _), Tensor(shape2, kind2, _), Tensor(shape3, kind3, _), Double(_), Bool(causal), Double(_), Bool(gqa)]
+                | [Tensor(shape1, kind1, _), Tensor(shape2, kind2, _), Tensor(shape3, kind3, _), Double(_), Bool(causal), Bool(gqa)] => {
+                    Some(TorchCallInfo::SDPA {
+                        q: TensorInfo {
+                            shape: shape1.clone(),
+                            dtype: *kind1,
+                        },
+                        k: TensorInfo {
+                            shape: shape2.clone(),
+                            dtype: *kind2,
+                        },
+                        v: TensorInfo {
+                            shape: shape3.clone(),
+                            dtype: *kind3,
+                        },
+                        mask: None,
                         causal: *causal,
                         gqa: *gqa,
                     })
@@ -828,6 +853,54 @@ impl TorchCallMsg {
                         },
                         max_q: *max_q,
                         max_k: *max_k,
+                        causal: *causal,
+                    })
+                }
+                _ => {
+                    log::warn!("{} args not match: {:?}", self.name, self.args);
+                    None
+                }
+            },
+            "aten::_scaled_dot_product_efficient_attention_backward" => match self.args.as_slice() {
+                [Tensor(_, _, _), Tensor(shape2, kind2, _), Tensor(shape3, kind3, _), Tensor(shape4, kind4, _), bias_arg, Tensor(_, _, _), Tensor(_, _, _), _, _, Double(_), List(_), Bool(causal), ..] => {
+                    Some(TorchCallInfo::SDPAEfficientBackward {
+                        q: TensorInfo {
+                            shape: shape2.clone(),
+                            dtype: *kind2,
+                        },
+                        k: TensorInfo {
+                            shape: shape3.clone(),
+                            dtype: *kind3,
+                        },
+                        v: TensorInfo {
+                            shape: shape4.clone(),
+                            dtype: *kind4,
+                        },
+                        bias: match bias_arg {
+                            Tensor(bias_shape, bias_kind, _) => Some(TensorInfo {
+                                shape: bias_shape.clone(),
+                                dtype: *bias_kind,
+                            }),
+                            _ => None,
+                        },
+                        causal: *causal,
+                    })
+                }
+                [Tensor(_, _, _), Tensor(shape2, kind2, _), Tensor(shape3, kind3, _), Tensor(shape4, kind4, _), Tensor(_, _, _), Tensor(_, _, _), _, _, Double(_), List(_), Bool(causal), ..] => {
+                    Some(TorchCallInfo::SDPAEfficientBackward {
+                        q: TensorInfo {
+                            shape: shape2.clone(),
+                            dtype: *kind2,
+                        },
+                        k: TensorInfo {
+                            shape: shape3.clone(),
+                            dtype: *kind3,
+                        },
+                        v: TensorInfo {
+                            shape: shape4.clone(),
+                            dtype: *kind4,
+                        },
+                        bias: None,
                         causal: *causal,
                     })
                 }
@@ -991,8 +1064,16 @@ pub enum TorchCallInfo {
         q: TensorInfo,
         k: TensorInfo,
         v: TensorInfo,
+        mask: Option<TensorInfo>,
         causal: bool,
         gqa: bool,
+    },
+    SDPAEfficientBackward {
+        q: TensorInfo,
+        k: TensorInfo,
+        v: TensorInfo,
+        bias: Option<TensorInfo>,
+        causal: bool,
     },
     SDPABackward {
         grad: TensorInfo,
