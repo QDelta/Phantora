@@ -420,6 +420,25 @@ impl Simulator {
         }
     }
 
+    /// Run the event queue to exhaustion and deliver any parked sync replies
+    /// whose events have completed. No-op when no reply is parked.
+    pub fn pump_parked_syncs(&mut self) {
+        if self.syncing.is_empty() {
+            return;
+        }
+        loop {
+            match self.queue.execute() {
+                QueueStep::EmptyQueue => return,
+                QueueStep::EventStarted(..) => (),
+                QueueStep::EventEnded(id, time) | QueueStep::ReachedPoint(id, time) => {
+                    if let Some(host) = self.syncing.remove(&id) {
+                        send_sync_response_to(&mut self.host_times, host, time, Some(id));
+                    }
+                }
+            }
+        }
+    }
+
     fn execute_to_time(
         queue: &mut EventQueue,
         syncing: &mut HashMap<EventId, ResponseId>,

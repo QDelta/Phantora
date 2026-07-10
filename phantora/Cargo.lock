@@ -807,6 +807,7 @@ name = "phantora"
 version = "0.0.1"
 dependencies = [
  "bincode",
+ "cc",
  "clap",
  "cuda_call",
  "env_logger",
@@ -1207,8 +1208,8 @@ checksum = "61c41af27dd6d1e27b1b16b489db798443478cef1f06a660c96db617ba5de3b1"
 
 [[package]]
 name = "tch"
-version = "0.20.0"
-source = "git+https://github.com/QDelta/tch-rs?branch=fix-0.20.0#c71bac49e98e06c5427f4ea8ddcf6fda704e1e30"
+version = "0.22.0"
+source = "git+https://github.com/QDelta/tch-rs?rev=f7fb153bd46c0df5f1107f3748b5595d6c39a1dc#f7fb153bd46c0df5f1107f3748b5595d6c39a1dc"
 dependencies = [
  "half",
  "lazy_static",
@@ -1305,8 +1306,8 @@ checksum = "5d99f8c9a7727884afe522e9bd5edbfc91a3312b36a77b5fb8926e4c31a41801"
 
 [[package]]
 name = "torch-sys"
-version = "0.20.0"
-source = "git+https://github.com/QDelta/tch-rs?branch=fix-0.20.0#c71bac49e98e06c5427f4ea8ddcf6fda704e1e30"
+version = "0.22.0"
+source = "git+https://github.com/QDelta/tch-rs?rev=f7fb153bd46c0df5f1107f3748b5595d6c39a1dc#f7fb153bd46c0df5f1107f3748b5595d6c39a1dc"
 dependencies = [
  "anyhow",
  "cc",

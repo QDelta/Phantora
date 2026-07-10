@@ -106,5 +106,6 @@ fn main_loop() {
                 simulator.handle_exit(host, cur);
             }
         }
+        simulator.pump_parked_syncs();
     }
 }
