@@ -186,8 +186,21 @@ def build(op, payload):
         c = alloc(P[0]).to(torch.bool); a = alloc(P[1])
         return lambda: torch.where(c, a, 1)
     if op == "SDPA":
+        # `mask` is absent from keys recorded before the materialized-mask fix;
+        # missing == None, matching serde's Option decoding of an old DB row.
         q, k, v = alloc(P["q"]), alloc(P["k"]), alloc(P["v"])
-        return lambda: F.scaled_dot_product_attention(q, k, v, is_causal=P["causal"], enable_gqa=P["gqa"])
+        mask = alloc(P["mask"]) if P.get("mask") else None
+        return lambda: F.scaled_dot_product_attention(
+            q, k, v, attn_mask=mask, is_causal=P["causal"], enable_gqa=P["gqa"])
+    if op == "SDPAEfficientBackward":
+        # Mirrors torch_estimate.rs: build the forward graph via autograd, then
+        # time only the backward (torch.autograd.grad == Tensor::run_backward
+        # with explicit inputs: returns grads, keeps the graph, no create_graph).
+        q = alloc(P["q"], requires_grad=True); k = alloc(P["k"], requires_grad=True); v = alloc(P["v"], requires_grad=True)
+        bias = alloc(P["bias"]) if P.get("bias") else None
+        out = F.scaled_dot_product_attention(
+            q, k, v, attn_mask=bias, dropout_p=0.0, is_causal=P["causal"]).sum(dtype=torch.float32)
+        return lambda: torch.autograd.grad(out, [q, k, v], retain_graph=True)
     if op == "SDPABackward":
         # Approximate the internal flash-attn backward via autograd: build the
         # forward graph once, time the backward.
@@ -293,7 +306,7 @@ def main():
     # is needed -- only expand() to reconstruct tensors for profiling.
     compute_out = os.path.join(out, "compute.csv")
     rows = load_existing(compute_out, 1) if args.merge else {}
-    n_ok = n_skip = 0
+    n_ok = n_skip = n_drop = 0
     with open(os.path.join(args.ref, "compute.csv")) as f:
         r = csv.reader(f); next(r)
         for row in r:
@@ -311,13 +324,28 @@ def main():
             except Exception as e:  # keep the DB complete; carry the reference time
                 nanos = int(ref_nanos)
                 n_skip += 1
+                if nanos == 0:
+                    # The ref time is a zero placeholder (a `<db>.missing` row), so
+                    # there is nothing to carry over. Writing it would bake a 0 ns
+                    # entry into the DB that replay then treats as a hit -- charging
+                    # the op no time and never reporting it missing again. Drop the
+                    # row instead: it stays missing and gets rediscovered.
+                    n_drop += 1
+                    print(f"  WARN {op}: {type(e).__name__}: {str(e)[:80]} -> DROPPED "
+                          f"(unprofilable, no reference time)", file=sys.stderr)
+                    continue
                 print(f"  WARN {op}: {type(e).__name__}: {str(e)[:80]} -> kept reference time", file=sys.stderr)
             rows[(key,)] = [key, nanos]
     with open(compute_out, "w", newline="") as g:
         w = csv.writer(g); w.writerow(["key", "nanos"])
         for row in sorted(rows.values()):
             w.writerow(row)
-    print(f"compute.csv: {n_ok} profiled, {n_skip} carried-over, {len(rows)} total")
+    print(f"compute.csv: {n_ok} profiled, {n_skip - n_drop} carried-over, "
+          f"{n_drop} dropped, {len(rows)} total")
+    if n_drop:
+        print(f"  {n_drop} op(s) could not be profiled and had no reference time; they are "
+              f"NOT in the DB and will be reported missing again on the next replay.",
+              file=sys.stderr)
 
     # memcpy.csv (key columns: kind, size_bytes)
     memcpy_out = os.path.join(out, "memcpy.csv")
