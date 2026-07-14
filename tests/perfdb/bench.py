@@ -266,6 +266,19 @@ def memcpy_thunk(kind, size):
     return lambda: d.copy_(s)
 
 
+def read_manifest_gpu(db_dir):
+    """GPU name recorded in a DB's manifest.md, or None. Mirrors the
+    `- **GPU:** ` prefix parse in perf_db.rs's PerfDb::load."""
+    path = os.path.join(db_dir, "manifest.md")
+    if not os.path.exists(path):
+        return None
+    with open(path) as f:
+        for line in f:
+            if line.startswith("- **GPU:** "):
+                return line[len("- **GPU:** "):].strip() or None
+    return None
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--ref", required=True, help="reference DB dir to take keys from (e.g. tests/perfdb/l40s)")
@@ -277,6 +290,9 @@ def main():
     ap.add_argument("--merge", action="store_true",
                     help="merge profiled keys into an existing --out DB (e.g. to fill a "
                          "<db>.missing manifest into <db>) instead of overwriting it")
+    ap.add_argument("--force", action="store_true",
+                    help="allow --merge into a DB recorded on a different GPU (produces a DB "
+                         "whose timings come from two GPUs; almost never what you want)")
     args = ap.parse_args()
     timer = time_wall if args.wall else time_kernel
 
@@ -285,6 +301,23 @@ def main():
     gpu = torch.cuda.get_device_name(0)
     out = args.out or os.path.join(os.path.dirname(args.ref.rstrip("/")), gpu.replace(" ", "_"))
     os.makedirs(out, exist_ok=True)
+
+    # A DB's timings are only meaningful for one GPU. Merging fills the *missing*
+    # keys from this GPU while the keys already present keep the original GPU's
+    # times, and the manifest below is rewritten with this GPU's name -- so a
+    # cross-GPU merge silently yields one DB blending two GPUs. Refuse it: the
+    # documented recovery loop ("on any GPU machine, run bench.py ... --merge")
+    # otherwise corrupts the target DB.
+    if args.merge:
+        target_gpu = read_manifest_gpu(out)
+        if target_gpu and target_gpu != gpu and not args.force:
+            sys.exit(
+                f"error: {out} was recorded on '{target_gpu}' but this machine is '{gpu}'.\n"
+                f"Merging would mix timings from two GPUs into one database. Either run this on "
+                f"an {target_gpu}, or record a separate DB for this GPU:\n"
+                f"    python3 {sys.argv[0]} --ref {args.ref} --out tests/perfdb/{gpu.replace(' ', '_').lower()}\n"
+                f"(pass --force to merge anyway.)"
+            )
     print(f"GPU: {gpu}\nref: {args.ref}\nout: {out}")
 
     def load_existing(path, nkey):

@@ -338,7 +338,10 @@ impl CudaEstimator {
             return dur;
         }
         if self.is_replay() {
-            self.missing_memcpy.push((kind, size)); // discovery; zero placeholder
+            // Discovery; zero placeholder, memoized so a recurring miss is
+            // recorded once (see TorchEstimator::estimate).
+            self.missing_memcpy.push((kind, size));
+            self.memcpy_cache.insert((kind, size), Duration::ZERO);
             return Duration::ZERO;
         }
         let dur = replay_memcpy(kind, size);
@@ -388,7 +391,10 @@ impl CudaEstimator {
             return dur;
         }
         if self.is_replay() {
-            self.missing_flash.push(key); // discovery; zero placeholder
+            // Discovery; zero placeholder, memoized so a recurring miss is
+            // recorded once (see TorchEstimator::estimate).
+            self.flash_attn_cache.insert(key.clone(), Duration::ZERO);
+            self.missing_flash.push(key);
             return Duration::ZERO;
         }
         let dur = Python::with_gil(|py| {

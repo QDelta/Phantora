@@ -130,11 +130,11 @@ A preset produces a fixed, enumerable set of kernel shapes, so a recorded **perf
 
 ```bash
 cd tests/docker/megatron
-python3 config_gen.py --nhost 1 --ngpu 8 --vram_mib 81920 --perf-db l40s
-./run.sh ./mixtral/run_mixtral_8x7b.sh --expert_model_parallel_size 8
+python3 config_gen.py --nhost 1 --ngpu 2 --vram_mib 81920 --perf-db l40s
+./run.sh ./mixtral/run_mixtral_8x7b.sh --expert_model_parallel_size 2 --sequence_length 1024
 ```
 
-The committed `tests/perfdb/l40s/` (recorded on an NVIDIA L40S) covers all presets. The CSV is human-readable — each row is one `(op, shape) → nanoseconds` entry.
+The committed `tests/perfdb/l40s/` (recorded on an NVIDIA L40S) covers each preset **at the exact config [`tests/perfdb/record_all.sh`](tests/perfdb/record_all.sh) recorded it at** — for Mixtral that is the 2-GPU, EP=2, sequence-length-1024 config above, which is why the command differs from the 8-GPU one in the preset's own header. Replaying a *different* config (more GPUs, a longer sequence, a different micro-batch) introduces kernel shapes the database does not have; that is not an error, but the run's numbers are invalid until you complete the database — see the next section. The CSV is human-readable — each row is one `(op, shape) → nanoseconds` entry.
 
 A database is **specific to the GPU and to the run config** (parallelism, sequence length, micro-batch) — but **not** to `num_layers` (layers repeat identical shapes), so a database recorded at 4 layers serves the full-depth preset at the same config.
 
@@ -159,6 +159,8 @@ python3 config_gen.py --nhost 1 --ngpu 8 --vram_mib 81920 --record-perf-db l40s
 # or record every preset at once:
 tests/perfdb/record_all.sh <NAME>
 ```
+
+Recording **merges** into an existing database: shapes it already contains are *not* re-profiled, so a re-record only adds the new ones. To re-time entries that are already there (e.g. after a change to how a kernel is captured), delete the directory first and record it from scratch. Recording into a database captured on a *different* GPU is refused, since it would leave the old GPU's timings in place while relabelling the database with the new GPU's name.
 
 To build a database for a **different GPU without building Phantora at all**, `tests/perfdb/bench.py` re-profiles an existing database's shapes using only stock PyTorch (it reads the `(op, shape)` keys and re-times each kernel locally):
 

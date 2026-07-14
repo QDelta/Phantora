@@ -459,10 +459,46 @@ mod tests {
                 q: ti(&[2, 32, 1024, 128], Kind::BFloat16),
                 k: ti(&[2, 32, 1024, 128], Kind::BFloat16),
                 v: ti(&[2, 32, 1024, 128], Kind::BFloat16),
+                mask: None,
                 causal: true,
                 gqa: false,
             },
             Duration::from_nanos(9_000),
+        );
+        // Attention variants that carry an Option<TensorInfo>: the materialized
+        // mask and the mem-efficient backward. Both are Some/None pairs, so cover
+        // both arms -- a Some(..) tensor nested in a struct variant is exactly the
+        // shape compact_value rewrites.
+        db.compute.insert(
+            TorchCallInfo::SDPA {
+                q: ti(&[2, 32, 1024, 128], Kind::BFloat16),
+                k: ti(&[2, 32, 1024, 128], Kind::BFloat16),
+                v: ti(&[2, 32, 1024, 128], Kind::BFloat16),
+                mask: Some(ti(&[2, 1, 1024, 1024], Kind::BFloat16)),
+                causal: false,
+                gqa: true,
+            },
+            Duration::from_nanos(11_000),
+        );
+        db.compute.insert(
+            TorchCallInfo::SDPAEfficientBackward {
+                q: ti(&[2, 32, 1024, 128], Kind::BFloat16),
+                k: ti(&[2, 32, 1024, 128], Kind::BFloat16),
+                v: ti(&[2, 32, 1024, 128], Kind::BFloat16),
+                bias: Some(ti(&[2, 32, 1024, 1024], Kind::BFloat16)),
+                causal: false,
+            },
+            Duration::from_nanos(13_000),
+        );
+        db.compute.insert(
+            TorchCallInfo::SDPAEfficientBackward {
+                q: ti(&[2, 32, 1024, 128], Kind::BFloat16),
+                k: ti(&[2, 32, 1024, 128], Kind::BFloat16),
+                v: ti(&[2, 32, 1024, 128], Kind::BFloat16),
+                bias: None,
+                causal: true,
+            },
+            Duration::from_nanos(14_000),
         );
 
         // Foreach op: interleaved periodic tensor lists exercise the {"R":...}

@@ -304,10 +304,33 @@ impl Simulator {
             if dir.is_dir() {
                 match PerfDb::load(dir) {
                     Ok(db) => {
+                        // Preloading merges this run's new shapes into the existing
+                        // DB -- but only the timings of *this* GPU may be added to
+                        // it. Recording into a DB captured on another GPU would
+                        // leave the old entries untouched (they hit the preloaded
+                        // cache and are never re-profiled) while save() restamps
+                        // the manifest with this GPU's name, silently producing a
+                        // DB that blends two GPUs under one label. Refuse instead.
+                        let local = cuda.gpu_name();
+                        if !db.gpu_name.is_empty() && !local.is_empty() && db.gpu_name != local {
+                            panic!(
+                                "perf-db record: {} was recorded on '{}' but this machine is \
+                                 '{}'. Recording would mix timings from two GPUs under one \
+                                 name. Record into a different directory, or delete {} to \
+                                 re-record it from scratch on this GPU.",
+                                dir.display(),
+                                db.gpu_name,
+                                local,
+                                dir.display(),
+                            );
+                        }
                         log::info!(
-                            "perf-db record: merging into existing DB at {} ({} compute entries)",
+                            "perf-db record: merging into existing DB at {} ({} compute entries, \
+                             recorded on '{}'). Entries already present are NOT re-profiled; \
+                             delete the directory to re-record them.",
                             dir.display(),
                             db.compute.len(),
+                            db.gpu_name,
                         );
                         cuda.preload(db.memcpy, db.flash_attn);
                         torch.preload(db.compute, db.sequence);
@@ -1734,18 +1757,25 @@ impl Simulator {
                     flash_attn,
                 };
                 match db.save(&missing_path) {
-                    Ok(()) => log::warn!(
-                        "perf-db replay: {} compute / {} memcpy / {} flash_attn shape(s) were NOT \
-                         in the database -- the simulated numbers from this run are INVALID. Wrote \
-                         the missing shapes to {m}. To complete the DB, profile them on a GPU with \
-                         `python3 tests/perfdb/bench.py --ref {m} --out {d} --merge` and re-run \
-                         (and consider contributing the result back).",
-                        db.compute.len(),
-                        db.memcpy.len(),
-                        db.flash_attn.len(),
-                        m = missing_path.display(),
-                        d = dir.display(),
-                    ),
+                    Ok(()) => {
+                        // Go to stderr as well as the log: this invalidates every
+                        // number the run just printed, and a log::warn! alone is
+                        // invisible when PHANTORA_LOG is set below `warn`.
+                        let msg = format!(
+                            "perf-db replay: {} compute / {} memcpy / {} flash_attn shape(s) were \
+                             NOT in the database -- the simulated numbers from this run are \
+                             INVALID. Wrote the missing shapes to {m}. To complete the DB, profile \
+                             them on a GPU with `python3 tests/perfdb/bench.py --ref {m} --out {d} \
+                             --merge` and re-run (and consider contributing the result back).",
+                            db.compute.len(),
+                            db.memcpy.len(),
+                            db.flash_attn.len(),
+                            m = missing_path.display(),
+                            d = dir.display(),
+                        );
+                        log::warn!("{msg}");
+                        eprintln!("WARNING: {msg}");
+                    }
                     Err(e) => log::error!(
                         "perf-db replay: failed to write missing manifest {}: {e}",
                         missing_path.display()

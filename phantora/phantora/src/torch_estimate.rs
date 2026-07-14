@@ -586,7 +586,12 @@ impl TorchEstimator {
         } else if self.replay {
             // Discovery: record the unrecorded shape and substitute a zero
             // placeholder so the run finishes and reports every missing shape.
+            // Memoize the placeholder so a recurring miss is recorded exactly
+            // once: a hot op repeats every layer of every step, and a foreach key
+            // holds thousands of TensorInfo, so re-cloning it per call would grow
+            // `missing` until the simulator is OOM-killed.
             self.missing.push(call.clone());
+            self.compute_cache.insert(call.clone(), Duration::ZERO);
             Duration::ZERO
         } else {
             let duration = self.run(2, call);
