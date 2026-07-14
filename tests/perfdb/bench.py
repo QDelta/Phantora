@@ -176,6 +176,23 @@ def build(op, payload):
     if op in ("Dropout", "NativeDropout"):
         a = alloc(P[0]); p = P[1] / 1_000_000.0; train = P[2]
         return (lambda: F.dropout(a, p, train)) if op == "Dropout" else (lambda: torch.native_dropout(a, p, train))
+    if op == "FusedDropout":
+        a = alloc(P[0]); p = P[1] / 1_000_000.0
+        return lambda: torch.ops.aten._fused_dropout(a, p)
+    if op == "GeluBackward":
+        g = alloc(P[0]); a = alloc(P[1])
+        return lambda: torch.ops.aten.gelu_backward(g, a, approximate="none")
+    if op == "Conv2d":
+        i = alloc(P["input"]); w = alloc(P["weight"])
+        b = alloc(P["bias"]) if P.get("bias") else None
+        return lambda: F.conv2d(i, w, b, P["stride"], P["padding"], P["dilation"], P["groups"])
+    if op == "Conv2dBackward":
+        # torch_estimate.rs times aten::_slow_conv2d_backward; use the functional
+        # (output_mask) overload rather than the out= variant it calls -- same
+        # kernels, and it doesn't need pre-allocated grad buffers.
+        g = alloc(P["grad_output"]); i = alloc(P["input"]); w = alloc(P["weight"])
+        return lambda: torch.ops.aten._slow_conv2d_backward(
+            g, i, w, P["kernel"], P["stride"], P["padding"], [True, True, True])
     if op == "NativeDropoutBackward":
         g = alloc(P[0]); m = alloc(P[1]); scale = P[2] / 1_000_000.0
         return lambda: torch.ops.aten.native_dropout_backward(g, m, scale)
@@ -243,6 +260,53 @@ def time_wall(thunk, warmup, iters):
         times.append(start.elapsed_time(end) * 1e6)  # ms -> ns
     times.sort()
     return int(times[len(times) // 2])  # median ns
+
+
+def round_multiple(x, m):
+    return (x + m - 1) // m * m
+
+
+_FLASH = None
+
+
+def flash_mod():
+    """The same extension module Phantora profiles against (from flash-attn).
+    Imported lazily: a DB with no flash_attn table needs only stock PyTorch."""
+    global _FLASH
+    if _FLASH is None:
+        import flash_attn_2_cuda
+        _FLASH = flash_attn_2_cuda
+    return _FLASH
+
+
+FLASH_COLS = ["is_fwd", "is_bf16", "batch", "seqlen_q", "seqlen_k", "num_heads",
+              "num_heads_k", "head_size", "win_left", "win_right", "is_causal"]
+
+
+def flash_thunk(row):
+    """Mirror CudaEstimator::flash_attn (cuda_estimate.rs): same operand shapes
+    (head_size rounded up to a multiple of 8 where it rounds), same softmax scale,
+    same fwd/bwd argument lists."""
+    fa = flash_mod()
+    r = dict(zip(FLASH_COLS, row))
+    b, sq, sk = int(r["batch"]), int(r["seqlen_q"]), int(r["seqlen_k"])
+    nh, nhk, hs = int(r["num_heads"]), int(r["num_heads_k"]), int(r["head_size"])
+    wl, wr = int(r["win_left"]), int(r["win_right"])
+    causal = r["is_causal"] == "true"
+    dt = torch.bfloat16 if r["is_bf16"] == "true" else torch.float16
+    hs8 = round_multiple(hs, 8)
+    scale = float(hs) ** -0.5
+    rnd = lambda *shape, dtype=dt: torch.randn(shape, dtype=dtype, device="cuda")
+
+    if r["is_fwd"] == "true":
+        q, k, v = rnd(b, sq, nh, hs8), rnd(b, sk, nhk, hs8), rnd(b, sk, nhk, hs8)
+        return lambda: fa.fwd(q, k, v, None, None, 0.0, scale, causal, wl, wr, 0.0, False, None)
+    dout = rnd(b, sq, nh, hs8)
+    q, k, v = rnd(b, sq, nh, hs), rnd(b, sk, nhk, hs), rnd(b, sk, nhk, hs)
+    o = rnd(b, sq, nh, hs)
+    lse = rnd(b, nh, sq, dtype=torch.float32)
+    return lambda: fa.bwd(dout, q, k, v, o, lse, None, None, None, None, 0.0, scale,
+                          causal, wl, wr, 0.0, False, None, None)
 
 
 def memcpy_thunk(kind, size):
@@ -383,7 +447,7 @@ def main():
     # memcpy.csv (key columns: kind, size_bytes)
     memcpy_out = os.path.join(out, "memcpy.csv")
     mrows = load_existing(memcpy_out, 2) if args.merge else {}
-    m_ok = 0
+    m_ok = m_drop = 0
     with open(os.path.join(args.ref, "memcpy.csv")) as f:
         r = csv.reader(f); next(r)
         for kind, size, ref_nanos in r:
@@ -392,22 +456,70 @@ def main():
                 m_ok += 1
             except Exception as e:
                 nanos = int(ref_nanos)
-                print(f"  WARN memcpy {kind}/{size}: {e}", file=sys.stderr)
+                if nanos == 0:  # a .missing placeholder: see the compute path
+                    m_drop += 1
+                    print(f"  WARN memcpy {kind}/{size}: {e} -> DROPPED (no reference time)",
+                          file=sys.stderr)
+                    continue
+                print(f"  WARN memcpy {kind}/{size}: {e} -> kept reference time", file=sys.stderr)
             mrows[(kind, size)] = [kind, size, nanos]
     with open(memcpy_out, "w", newline="") as g:
         w = csv.writer(g); w.writerow(["kind", "size_bytes", "nanos"])
         for row in sorted(mrows.values(), key=lambda x: (x[0], int(x[1]))):
             w.writerow(row)
-    print(f"memcpy.csv: {m_ok} profiled, {len(mrows)} total")
+    print(f"memcpy.csv: {m_ok} profiled, {m_drop} dropped, {len(mrows)} total")
 
-    # sequence/flash_attn: empty under single-op timing. Copy from ref only for a
-    # fresh DB; when merging, leave the existing DB's tables untouched.
-    if not args.merge:
-        for name in ("sequence.csv", "flash_attn.csv"):
-            src = os.path.join(args.ref, name)
-            if os.path.exists(src):
-                with open(src) as f, open(os.path.join(out, name), "w") as g:
-                    g.write(f.read())
+    # flash_attn.csv (key columns: the 11 FlashAttnKey fields). Profiled like any
+    # other table -- it used to be byte-copied from the ref, which meant a
+    # `<db>.missing` flash table (all 0 ns) was copied in verbatim and then read
+    # back by replay as real hits, silently charging attention no time forever.
+    flash_ref = os.path.join(args.ref, "flash_attn.csv")
+    flash_out = os.path.join(out, "flash_attn.csv")
+    if os.path.exists(flash_ref):
+        frows = load_existing(flash_out, len(FLASH_COLS)) if args.merge else {}
+        f_ok = f_carry = f_drop = 0
+        with open(flash_ref) as f:
+            r = csv.reader(f); next(r)
+            for row in r:
+                if not row:
+                    continue
+                key, ref_nanos = tuple(row[:len(FLASH_COLS)]), int(row[len(FLASH_COLS)])
+                try:
+                    nanos = timer(flash_thunk(key), args.warmup, args.iters)
+                    f_ok += 1
+                except Exception as e:
+                    if ref_nanos == 0:  # a .missing placeholder: see the compute path
+                        f_drop += 1
+                        print(f"  WARN flash_attn {key}: {type(e).__name__}: {str(e)[:60]} -> "
+                              f"DROPPED (unprofilable, no reference time)", file=sys.stderr)
+                        continue
+                    nanos = ref_nanos
+                    f_carry += 1
+                    print(f"  WARN flash_attn {key}: {type(e).__name__}: {str(e)[:60]} -> "
+                          f"kept reference time", file=sys.stderr)
+                frows[key] = list(key) + [nanos]
+        if frows:
+            with open(flash_out, "w", newline="") as g:
+                w = csv.writer(g); w.writerow(FLASH_COLS + ["nanos"])
+                for row in sorted(frows.values()):
+                    w.writerow(row)
+        print(f"flash_attn.csv: {f_ok} profiled, {f_carry} carried-over, "
+              f"{f_drop} dropped, {len(frows)} total")
+        if f_drop or f_carry:
+            print("  flash-attn rows need the `flash_attn_2_cuda` module (pip install flash-attn) "
+                  "-- the same extension Phantora profiles against.", file=sys.stderr)
+
+    # sequence.csv: hash-keyed groups of calls, not (op, shape) -- they cannot be
+    # re-profiled from the DB alone. Both perf-db modes force single-op timing, so
+    # this table is empty in practice; if a ref ever carries one, skip it rather
+    # than copy another GPU's timings into this GPU's database.
+    seq_ref = os.path.join(args.ref, "sequence.csv")
+    if os.path.exists(seq_ref):
+        with open(seq_ref) as f:
+            n_seq = max(0, sum(1 for _ in f) - 1)
+        if n_seq:
+            print(f"  WARN sequence.csv: {n_seq} row(s) in {args.ref} cannot be re-profiled "
+                  f"(hash-keyed sequences); not copied into {out}.", file=sys.stderr)
 
     with open(os.path.join(out, "manifest.md"), "w") as f:
         f.write(f"# Phantora performance database\n\n- **GPU:** {gpu}\n- **Schema version:** 1\n"
