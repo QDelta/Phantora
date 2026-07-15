@@ -1,0 +1,532 @@
+#!/usr/bin/env python3
+"""Generate a Phantora performance database on a GPU, WITHOUT building Phantora.
+
+A Phantora perf DB is just `(op, shape) -> time`. The op+shape *keys* are
+GPU-independent; only the *times* are GPU-specific. So this tool takes the keys
+from an existing reference DB (e.g. tests/perfdb/l40s/), re-profiles each kernel
+on the local GPU with **stock PyTorch**, and writes a fresh DB in the same CSV
+format. No C stubs, no Rust simulator, no patched PyTorch -- just `torch`.
+
+It mirrors phantora/src/torch_estimate.rs: the same op dispatch, the same
+allocation aliasing (operands of equal size+dtype share one buffer within an op),
+and kernel-only device timing via torch.profiler (matching Phantora's CUPTI
+sum). Verified to reproduce a Phantora-recorded DB: per-op times match to ~1%
+median and a replayed preset's simulated iteration time is identical. Pass
+--wall to use CUDA-event wall time instead (includes launch overhead).
+
+Usage:
+    python3 bench.py --ref tests/perfdb/l40s --out tests/perfdb/my_gpu
+    python3 bench.py --ref tests/perfdb/l40s            # --out defaults to the GPU name
+
+Replay the result with Phantora: `config_gen.py ... --perf-db <out-name>`.
+"""
+import argparse
+import csv
+import json
+import os
+import sys
+
+import torch
+import torch.nn.functional as F
+from torch.profiler import ProfilerActivity, profile
+
+# tch::Kind serialized name -> torch dtype
+DTYPE = {
+    "Uint8": torch.uint8, "Int8": torch.int8, "Int16": torch.int16,
+    "Int": torch.int32, "Int64": torch.int64, "Half": torch.float16,
+    "Float": torch.float32, "Double": torch.float64, "Bool": torch.bool,
+    "BFloat16": torch.bfloat16,
+}
+
+# Compact-tensor dtype code -> Kind name. Mirrors DTYPE_CODES in
+# phantora/phantora/src/perf_db.rs; keep the two in sync.
+CODE_TO_KIND = {
+    "f32": "Float", "f64": "Double", "f16": "Half", "bf16": "BFloat16",
+    "b8": "Bool", "i32": "Int", "i64": "Int64", "i16": "Int16",
+    "i8": "Int8", "u8": "Uint8",
+}
+
+
+def expand(v):
+    """Inverse of perf_db.rs `compact_value`: a compact tensor `[code,[dims]]`
+    -> `{shape,dtype}`, and `{"R":[k,[period]]}` -> the period repeated k times.
+    Leaves the legacy verbose `{shape,dtype}` form untouched."""
+    if isinstance(v, dict):
+        if len(v) == 1 and isinstance(v.get("R"), list) and len(v["R"]) == 2:
+            k, period = v["R"]
+            out = []
+            for _ in range(k):
+                out.extend(expand(e) for e in period)
+            return out
+        return {kk: expand(val) for kk, val in v.items()}
+    if isinstance(v, list):
+        if len(v) == 2 and isinstance(v[0], str) and v[0] in CODE_TO_KIND and isinstance(v[1], list):
+            return {"shape": v[1], "dtype": CODE_TO_KIND[v[0]]}
+        return [expand(e) for e in v]
+    return v
+
+
+# Per-op allocation cache keyed by (numel, dtype), mirroring torch_estimate.rs's
+# `allocate`/`tensor_cache`: within one op, operands of the same size+dtype reuse
+# (alias) one buffer. This matters for memory-bound multi-operand ops (e.g. the
+# Adam `_foreach_addc*_` step) -- aliasing ~halves memory traffic, so reproducing
+# it keeps the bench's timings consistent with a Phantora-recorded DB.
+_ACACHE = {}
+
+
+def _make(shape, dt, device):
+    if dt.is_floating_point:
+        return torch.randn(shape, dtype=dt, device=device)
+    if dt == torch.bool:
+        return torch.randint(0, 2, shape, device=device).to(torch.bool)
+    return torch.randint(0, 128, shape, dtype=dt, device=device)
+
+
+def alloc(ti, device="cuda", requires_grad=False):
+    """Allocate a tensor matching a TensorInfo {shape, dtype}, reusing a cached
+    buffer of the same (numel, dtype) like Phantora does (autograd leaves excepted)."""
+    shape = ti["shape"]
+    dt = DTYPE.get(ti["dtype"], torch.float32)
+    if requires_grad:  # autograd leaves must be distinct, not aliased views
+        return _make(shape, dt, device).detach().requires_grad_(True)
+    numel = 1
+    for d in shape:
+        numel *= d
+    key = (numel, dt)
+    buf = _ACACHE.get(key)
+    if buf is None:
+        buf = _make([numel], dt, device)
+        _ACACHE[key] = buf
+    return buf.view(shape)
+
+
+def is_ti(x):
+    return isinstance(x, dict) and "shape" in x and "dtype" in x
+
+
+# op name -> function(payload) returning a zero-arg thunk that runs the op.
+# payload is the JSON value under the variant name (dict for newtype/struct,
+# list for tuple/Vec). Tensors are allocated up front (outside timing).
+def build(op, payload):
+    P = payload
+    _ACACHE.clear()  # fresh per op; aliases same-(numel,dtype) operands within this op
+
+    def two():            # tuple of two TensorInfo
+        return alloc(P[0]), alloc(P[1])
+
+    if op == "MM":
+        a, b = two(); return lambda: torch.mm(a, b)
+    if op == "MatMul":
+        a, b = two(); return lambda: torch.matmul(a, b)
+    if op == "BMM":
+        a, b = two(); return lambda: torch.bmm(a, b)
+    if op == "Linear":
+        a = alloc(P[0]); w = alloc(P[1]); bias = alloc(P[2]) if P[2] else None
+        return lambda: F.linear(a, w, bias)
+    if op == "AddMM":
+        a, b, c = alloc(P[0]), alloc(P[1]), alloc(P[2]); return lambda: torch.addmm(a, b, c)
+    if op == "BAddBMM":
+        a, b, c = alloc(P[0]), alloc(P[1]), alloc(P[2]); return lambda: torch.baddbmm(a, b, c)
+    if op in ("Mul", "Add", "Div"):
+        a, b = two()
+        return {"Mul": lambda: a * b, "Add": lambda: a + b, "Div": lambda: a / b}[op]
+    if op == "Mul_":
+        a, b = two(); return lambda: a.mul_(b)
+    if op == "Add_":
+        a, b = two(); return lambda: a.add_(b)
+    if op == "MulScalar":
+        a = alloc(P); return lambda: a * 2
+    if op == "MulScalar_":
+        a = alloc(P); return lambda: a.mul_(2)
+    if op == "DivScalar":
+        a = alloc(P); return lambda: a / 2
+    if op == "Pow":
+        a = alloc(P); return lambda: a.pow(2)
+    if op == "Sqrt":
+        a = alloc(P); return lambda: a.sqrt()
+    if op == "Sum":
+        a = alloc(P); dt = DTYPE.get(P["dtype"], torch.float32); return lambda: a.sum(dtype=dt)
+    if op == "ZerosLike":
+        a = alloc(P); return lambda: torch.zeros_like(a)
+    if op == "ConvDType":
+        a = alloc(P[0]); dt = DTYPE.get(P[1], torch.float32); return lambda: a.to(dt)
+    if op == "Gelu":
+        a = alloc(P); return lambda: F.gelu(a)
+    if op == "Softmax":
+        a = alloc(P[0]); dim = P[1]; dt = DTYPE.get(P[0]["dtype"], torch.float32)
+        return lambda: torch.softmax(a, dim, dtype=dt)
+    if op == "SoftmaxBackward":
+        g = alloc(P[0]); o = alloc(P[1]); dim = P[2]; dt = DTYPE.get(P[0]["dtype"], torch.float32)
+        return lambda: torch.ops.aten._softmax_backward_data(g, o, dim, dt)
+    if op in ("AddCMul_", "AddCDiv_"):
+        a, b, c = alloc(P[0]), alloc(P[1]), alloc(P[2])
+        return (lambda: a.addcmul_(b, c)) if op == "AddCMul_" else (lambda: a.addcdiv_(b, c))
+    if op == "ForeachMulScalar_":
+        ts = [alloc(ti) for ti in P]; return lambda: torch._foreach_mul_(ts, 2)
+    if op == "ForeachMul_":
+        l1 = [alloc(ti) for ti in P[0]]; l2 = [alloc(ti) for ti in P[1]]
+        return lambda: torch._foreach_mul_(l1, l2)
+    if op in ("ForeachAddCMul_", "ForeachAddCDiv_"):
+        l1 = [alloc(ti) for ti in P[0]]; l2 = [alloc(ti) for ti in P[1]]; l3 = [alloc(ti) for ti in P[2]]
+        fn = torch._foreach_addcmul_ if op == "ForeachAddCMul_" else torch._foreach_addcdiv_
+        return lambda: fn(l1, l2, l3, 2)
+    if op in ("MaskedFill", "MaskedFill_"):
+        a = alloc(P[0]); m = alloc(P[1]).to(torch.bool)
+        return (lambda: a.masked_fill(m, -10000.0)) if op == "MaskedFill" else (lambda: a.masked_fill_(m, -10000.0))
+    if op in ("Dropout", "NativeDropout"):
+        a = alloc(P[0]); p = P[1] / 1_000_000.0; train = P[2]
+        return (lambda: F.dropout(a, p, train)) if op == "Dropout" else (lambda: torch.native_dropout(a, p, train))
+    if op == "FusedDropout":
+        a = alloc(P[0]); p = P[1] / 1_000_000.0
+        return lambda: torch.ops.aten._fused_dropout(a, p)
+    if op == "GeluBackward":
+        g = alloc(P[0]); a = alloc(P[1])
+        return lambda: torch.ops.aten.gelu_backward(g, a, approximate="none")
+    if op == "Conv2d":
+        i = alloc(P["input"]); w = alloc(P["weight"])
+        b = alloc(P["bias"]) if P.get("bias") else None
+        return lambda: F.conv2d(i, w, b, P["stride"], P["padding"], P["dilation"], P["groups"])
+    if op == "Conv2dBackward":
+        # torch_estimate.rs times aten::_slow_conv2d_backward; use the functional
+        # (output_mask) overload rather than the out= variant it calls -- same
+        # kernels, and it doesn't need pre-allocated grad buffers.
+        g = alloc(P["grad_output"]); i = alloc(P["input"]); w = alloc(P["weight"])
+        return lambda: torch.ops.aten._slow_conv2d_backward(
+            g, i, w, P["kernel"], P["stride"], P["padding"], [True, True, True])
+    if op == "NativeDropoutBackward":
+        g = alloc(P[0]); m = alloc(P[1]); scale = P[2] / 1_000_000.0
+        return lambda: torch.ops.aten.native_dropout_backward(g, m, scale)
+    if op == "Where":
+        c = alloc(P[0]).to(torch.bool); a = alloc(P[1]); b = alloc(P[2])
+        return lambda: torch.where(c, a, b)
+    if op == "WhereScalar":
+        c = alloc(P[0]).to(torch.bool); a = alloc(P[1])
+        return lambda: torch.where(c, a, 1)
+    if op == "SDPA":
+        # `mask` is absent from keys recorded before the materialized-mask fix;
+        # missing == None, matching serde's Option decoding of an old DB row.
+        q, k, v = alloc(P["q"]), alloc(P["k"]), alloc(P["v"])
+        mask = alloc(P["mask"]) if P.get("mask") else None
+        return lambda: F.scaled_dot_product_attention(
+            q, k, v, attn_mask=mask, is_causal=P["causal"], enable_gqa=P["gqa"])
+    if op == "SDPAEfficientBackward":
+        # Mirrors torch_estimate.rs: build the forward graph via autograd, then
+        # time only the backward (torch.autograd.grad == Tensor::run_backward
+        # with explicit inputs: returns grads, keeps the graph, no create_graph).
+        q = alloc(P["q"], requires_grad=True); k = alloc(P["k"], requires_grad=True); v = alloc(P["v"], requires_grad=True)
+        bias = alloc(P["bias"]) if P.get("bias") else None
+        out = F.scaled_dot_product_attention(
+            q, k, v, attn_mask=bias, dropout_p=0.0, is_causal=P["causal"]).sum(dtype=torch.float32)
+        return lambda: torch.autograd.grad(out, [q, k, v], retain_graph=True)
+    if op == "SDPABackward":
+        # Approximate the internal flash-attn backward via autograd: build the
+        # forward graph once, time the backward.
+        q = alloc(P["q"], requires_grad=True); k = alloc(P["k"], requires_grad=True); v = alloc(P["v"], requires_grad=True)
+        out = F.scaled_dot_product_attention(q, k, v, is_causal=P["causal"])
+        g = alloc(P["grad"])
+        return lambda: out.backward(g, retain_graph=True)
+    return None  # unknown op
+
+
+def time_kernel(thunk, warmup, iters):
+    """Kernel-only device time, mirroring Phantora's CUPTI sum: profile `iters`
+    runs and sum each kernel's self device time (excludes launch/CPU overhead)."""
+    for _ in range(warmup):
+        thunk()
+    torch.cuda.synchronize()
+    with profile(activities=[ProfilerActivity.CUDA]) as prof:
+        for _ in range(iters):
+            thunk()
+        torch.cuda.synchronize()
+    us = sum(
+        getattr(e, "self_device_time_total", 0) or getattr(e, "self_cuda_time_total", 0)
+        for e in prof.key_averages()
+    )
+    return int(us * 1000 / iters)  # us total over iters -> ns per iter
+
+
+def time_wall(thunk, warmup, iters):
+    """Wall GPU time via CUDA events (includes launch overhead); --wall option."""
+    for _ in range(warmup):
+        thunk()
+    torch.cuda.synchronize()
+    times = []
+    start, end = torch.cuda.Event(True), torch.cuda.Event(True)
+    for _ in range(iters):
+        start.record()
+        thunk()
+        end.record()
+        torch.cuda.synchronize()
+        times.append(start.elapsed_time(end) * 1e6)  # ms -> ns
+    times.sort()
+    return int(times[len(times) // 2])  # median ns
+
+
+def round_multiple(x, m):
+    return (x + m - 1) // m * m
+
+
+_FLASH = None
+
+
+def flash_mod():
+    """The same extension module Phantora profiles against (from flash-attn).
+    Imported lazily: a DB with no flash_attn table needs only stock PyTorch."""
+    global _FLASH
+    if _FLASH is None:
+        import flash_attn_2_cuda
+        _FLASH = flash_attn_2_cuda
+    return _FLASH
+
+
+FLASH_COLS = ["is_fwd", "is_bf16", "batch", "seqlen_q", "seqlen_k", "num_heads",
+              "num_heads_k", "head_size", "win_left", "win_right", "is_causal"]
+
+
+def flash_thunk(row):
+    """Mirror CudaEstimator::flash_attn (cuda_estimate.rs): same operand shapes
+    (head_size rounded up to a multiple of 8 where it rounds), same softmax scale,
+    same fwd/bwd argument lists."""
+    fa = flash_mod()
+    r = dict(zip(FLASH_COLS, row))
+    b, sq, sk = int(r["batch"]), int(r["seqlen_q"]), int(r["seqlen_k"])
+    nh, nhk, hs = int(r["num_heads"]), int(r["num_heads_k"]), int(r["head_size"])
+    wl, wr = int(r["win_left"]), int(r["win_right"])
+    causal = r["is_causal"] == "true"
+    dt = torch.bfloat16 if r["is_bf16"] == "true" else torch.float16
+    hs8 = round_multiple(hs, 8)
+    scale = float(hs) ** -0.5
+    rnd = lambda *shape, dtype=dt: torch.randn(shape, dtype=dtype, device="cuda")
+
+    if r["is_fwd"] == "true":
+        q, k, v = rnd(b, sq, nh, hs8), rnd(b, sk, nhk, hs8), rnd(b, sk, nhk, hs8)
+        return lambda: fa.fwd(q, k, v, None, None, 0.0, scale, causal, wl, wr, 0.0, False, None)
+    dout = rnd(b, sq, nh, hs8)
+    q, k, v = rnd(b, sq, nh, hs), rnd(b, sk, nhk, hs), rnd(b, sk, nhk, hs)
+    o = rnd(b, sq, nh, hs)
+    lse = rnd(b, nh, sq, dtype=torch.float32)
+    return lambda: fa.bwd(dout, q, k, v, o, lse, None, None, None, None, 0.0, scale,
+                          causal, wl, wr, 0.0, False, None, None)
+
+
+def memcpy_thunk(kind, size):
+    n = max(size, 1)
+    cuda, cpu = torch.device("cuda"), torch.device("cpu")
+    def buf(dev, pin=False):
+        t = torch.empty(n, dtype=torch.uint8, device=dev)
+        return t.pin_memory() if pin and dev == cpu else t
+    if kind == "DeviceToDevice":
+        s, d = buf(cuda), buf(cuda)
+    elif kind == "HostToDevice":
+        s, d = buf(cpu), buf(cuda)
+    elif kind == "PinnedHostToDevice":
+        s, d = buf(cpu, pin=True), buf(cuda)
+    elif kind == "DeviceToHost":
+        s, d = buf(cuda), buf(cpu)
+    elif kind == "DeviceToPinnedHost":
+        s, d = buf(cuda), buf(cpu, pin=True)
+    else:  # HostToHost
+        s, d = buf(cpu), buf(cpu)
+    return lambda: d.copy_(s)
+
+
+def read_manifest_gpu(db_dir):
+    """GPU name recorded in a DB's manifest.md, or None. Mirrors the
+    `- **GPU:** ` prefix parse in perf_db.rs's PerfDb::load."""
+    path = os.path.join(db_dir, "manifest.md")
+    if not os.path.exists(path):
+        return None
+    with open(path) as f:
+        for line in f:
+            if line.startswith("- **GPU:** "):
+                return line[len("- **GPU:** "):].strip() or None
+    return None
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--ref", required=True, help="reference DB dir to take keys from (e.g. tests/perfdb/l40s)")
+    ap.add_argument("--out", default=None, help="output DB dir (default: tests/perfdb/<gpu-name>)")
+    ap.add_argument("--warmup", type=int, default=3)
+    ap.add_argument("--iters", type=int, default=5)
+    ap.add_argument("--wall", action="store_true",
+                    help="use CUDA-event wall time instead of kernel-only (default) timing")
+    ap.add_argument("--merge", action="store_true",
+                    help="merge profiled keys into an existing --out DB (e.g. to fill a "
+                         "<db>.missing manifest into <db>) instead of overwriting it")
+    ap.add_argument("--force", action="store_true",
+                    help="allow --merge into a DB recorded on a different GPU (produces a DB "
+                         "whose timings come from two GPUs; almost never what you want)")
+    args = ap.parse_args()
+    timer = time_wall if args.wall else time_kernel
+
+    if not torch.cuda.is_available():
+        sys.exit("error: a CUDA GPU is required to record timings")
+    gpu = torch.cuda.get_device_name(0)
+    out = args.out or os.path.join(os.path.dirname(args.ref.rstrip("/")), gpu.replace(" ", "_"))
+    os.makedirs(out, exist_ok=True)
+
+    # A DB's timings are only meaningful for one GPU. Merging fills the *missing*
+    # keys from this GPU while the keys already present keep the original GPU's
+    # times, and the manifest below is rewritten with this GPU's name -- so a
+    # cross-GPU merge silently yields one DB blending two GPUs. Refuse it: the
+    # documented recovery loop ("on any GPU machine, run bench.py ... --merge")
+    # otherwise corrupts the target DB.
+    if args.merge:
+        target_gpu = read_manifest_gpu(out)
+        if target_gpu and target_gpu != gpu and not args.force:
+            sys.exit(
+                f"error: {out} was recorded on '{target_gpu}' but this machine is '{gpu}'.\n"
+                f"Merging would mix timings from two GPUs into one database. Either run this on "
+                f"an {target_gpu}, or record a separate DB for this GPU:\n"
+                f"    python3 {sys.argv[0]} --ref {args.ref} --out tests/perfdb/{gpu.replace(' ', '_').lower()}\n"
+                f"(pass --force to merge anyway.)"
+            )
+    print(f"GPU: {gpu}\nref: {args.ref}\nout: {out}")
+
+    def load_existing(path, nkey):
+        """Load an existing CSV into {tuple(first nkey cols): full row}."""
+        rows = {}
+        if os.path.exists(path):
+            with open(path) as f:
+                rd = csv.reader(f)
+                next(rd, None)
+                for row in rd:
+                    if row:
+                        rows[tuple(row[:nkey])] = row
+        return rows
+
+    # compute.csv (columns: key, nanos; key = compacted TorchCallInfo JSON, op is
+    # its single outer key). With --merge, start from the existing out DB and
+    # overlay the profiled keys; otherwise write a fresh table. The original
+    # (compact) key string is carried through verbatim, so no Python compaction
+    # is needed -- only expand() to reconstruct tensors for profiling.
+    compute_out = os.path.join(out, "compute.csv")
+    rows = load_existing(compute_out, 1) if args.merge else {}
+    n_ok = n_skip = n_drop = 0
+    with open(os.path.join(args.ref, "compute.csv")) as f:
+        r = csv.reader(f); next(r)
+        for row in r:
+            if not row:
+                continue
+            key, ref_nanos = row[0], row[1]
+            obj = json.loads(key)
+            op = next(iter(obj))
+            try:
+                thunk = build(op, expand(obj[op]))
+                if thunk is None:
+                    raise NotImplementedError(op)
+                nanos = timer(thunk, args.warmup, args.iters)
+                n_ok += 1
+            except Exception as e:  # keep the DB complete; carry the reference time
+                nanos = int(ref_nanos)
+                n_skip += 1
+                if nanos == 0:
+                    # The ref time is a zero placeholder (a `<db>.missing` row), so
+                    # there is nothing to carry over. Writing it would bake a 0 ns
+                    # entry into the DB that replay then treats as a hit -- charging
+                    # the op no time and never reporting it missing again. Drop the
+                    # row instead: it stays missing and gets rediscovered.
+                    n_drop += 1
+                    print(f"  WARN {op}: {type(e).__name__}: {str(e)[:80]} -> DROPPED "
+                          f"(unprofilable, no reference time)", file=sys.stderr)
+                    continue
+                print(f"  WARN {op}: {type(e).__name__}: {str(e)[:80]} -> kept reference time", file=sys.stderr)
+            rows[(key,)] = [key, nanos]
+    with open(compute_out, "w", newline="") as g:
+        w = csv.writer(g); w.writerow(["key", "nanos"])
+        for row in sorted(rows.values()):
+            w.writerow(row)
+    print(f"compute.csv: {n_ok} profiled, {n_skip - n_drop} carried-over, "
+          f"{n_drop} dropped, {len(rows)} total")
+    if n_drop:
+        print(f"  {n_drop} op(s) could not be profiled and had no reference time; they are "
+              f"NOT in the DB and will be reported missing again on the next replay.",
+              file=sys.stderr)
+
+    # memcpy.csv (key columns: kind, size_bytes)
+    memcpy_out = os.path.join(out, "memcpy.csv")
+    mrows = load_existing(memcpy_out, 2) if args.merge else {}
+    m_ok = m_drop = 0
+    with open(os.path.join(args.ref, "memcpy.csv")) as f:
+        r = csv.reader(f); next(r)
+        for kind, size, ref_nanos in r:
+            try:
+                nanos = timer(memcpy_thunk(kind, int(size)), args.warmup, args.iters)
+                m_ok += 1
+            except Exception as e:
+                nanos = int(ref_nanos)
+                if nanos == 0:  # a .missing placeholder: see the compute path
+                    m_drop += 1
+                    print(f"  WARN memcpy {kind}/{size}: {e} -> DROPPED (no reference time)",
+                          file=sys.stderr)
+                    continue
+                print(f"  WARN memcpy {kind}/{size}: {e} -> kept reference time", file=sys.stderr)
+            mrows[(kind, size)] = [kind, size, nanos]
+    with open(memcpy_out, "w", newline="") as g:
+        w = csv.writer(g); w.writerow(["kind", "size_bytes", "nanos"])
+        for row in sorted(mrows.values(), key=lambda x: (x[0], int(x[1]))):
+            w.writerow(row)
+    print(f"memcpy.csv: {m_ok} profiled, {m_drop} dropped, {len(mrows)} total")
+
+    # flash_attn.csv (key columns: the 11 FlashAttnKey fields). Profiled like any
+    # other table -- it used to be byte-copied from the ref, which meant a
+    # `<db>.missing` flash table (all 0 ns) was copied in verbatim and then read
+    # back by replay as real hits, silently charging attention no time forever.
+    flash_ref = os.path.join(args.ref, "flash_attn.csv")
+    flash_out = os.path.join(out, "flash_attn.csv")
+    if os.path.exists(flash_ref):
+        frows = load_existing(flash_out, len(FLASH_COLS)) if args.merge else {}
+        f_ok = f_carry = f_drop = 0
+        with open(flash_ref) as f:
+            r = csv.reader(f); next(r)
+            for row in r:
+                if not row:
+                    continue
+                key, ref_nanos = tuple(row[:len(FLASH_COLS)]), int(row[len(FLASH_COLS)])
+                try:
+                    nanos = timer(flash_thunk(key), args.warmup, args.iters)
+                    f_ok += 1
+                except Exception as e:
+                    if ref_nanos == 0:  # a .missing placeholder: see the compute path
+                        f_drop += 1
+                        print(f"  WARN flash_attn {key}: {type(e).__name__}: {str(e)[:60]} -> "
+                              f"DROPPED (unprofilable, no reference time)", file=sys.stderr)
+                        continue
+                    nanos = ref_nanos
+                    f_carry += 1
+                    print(f"  WARN flash_attn {key}: {type(e).__name__}: {str(e)[:60]} -> "
+                          f"kept reference time", file=sys.stderr)
+                frows[key] = list(key) + [nanos]
+        if frows:
+            with open(flash_out, "w", newline="") as g:
+                w = csv.writer(g); w.writerow(FLASH_COLS + ["nanos"])
+                for row in sorted(frows.values()):
+                    w.writerow(row)
+        print(f"flash_attn.csv: {f_ok} profiled, {f_carry} carried-over, "
+              f"{f_drop} dropped, {len(frows)} total")
+        if f_drop or f_carry:
+            print("  flash-attn rows need the `flash_attn_2_cuda` module (pip install flash-attn) "
+                  "-- the same extension Phantora profiles against.", file=sys.stderr)
+
+    # sequence.csv: hash-keyed groups of calls, not (op, shape) -- they cannot be
+    # re-profiled from the DB alone. Both perf-db modes force single-op timing, so
+    # this table is empty in practice; if a ref ever carries one, skip it rather
+    # than copy another GPU's timings into this GPU's database.
+    seq_ref = os.path.join(args.ref, "sequence.csv")
+    if os.path.exists(seq_ref):
+        with open(seq_ref) as f:
+            n_seq = max(0, sum(1 for _ in f) - 1)
+        if n_seq:
+            print(f"  WARN sequence.csv: {n_seq} row(s) in {args.ref} cannot be re-profiled "
+                  f"(hash-keyed sequences); not copied into {out}.", file=sys.stderr)
+
+    with open(os.path.join(out, "manifest.md"), "w") as f:
+        f.write(f"# Phantora performance database\n\n- **GPU:** {gpu}\n- **Schema version:** 1\n"
+                f"- Recorded by tests/perfdb/bench.py (stock PyTorch, no Phantora build) "
+                f"from keys in `{args.ref}`.\n")
+    print(f"done -> {out}")
+
+
+if __name__ == "__main__":
+    main()

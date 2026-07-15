@@ -2,6 +2,7 @@ use crate::args;
 use crate::cuda_estimate::CudaEstimator;
 use crate::event_queue::{Action, EventId, EventQueue, QueueStep};
 use crate::nccl_ops::{NcclOps, SimpleRing, Trace};
+use crate::perf_db::PerfDb;
 use crate::torch_call::TorchCall;
 use crate::torch_estimate::TorchEstimator;
 use cuda_call::{
@@ -272,10 +273,83 @@ impl TorchCallSeq {
 }
 
 impl Simulator {
+    /// Build the timing estimators according to the perf-db mode:
+    /// - `--perf-db <dir>`: replay — load the DB, no GPU init, miss = hard error.
+    /// - `--record-perf-db <dir>`: GPU estimators, preloaded from an existing DB
+    ///   (if any) so the run merges into it; dumped on exit (see `handle_exit`).
+    /// - neither: GPU estimators, profile-on-miss (original behavior).
+    fn build_estimators() -> (CudaEstimator, TorchEstimator) {
+        let args = args::get_args();
+        if let Some(dir) = &args.perf_db {
+            let db = PerfDb::load(dir)
+                .unwrap_or_else(|e| panic!("perf-db: failed to load {}: {e}", dir.display()));
+            log::info!(
+                "perf-db replay: loaded {} compute, {} sequence, {} memcpy, {} flash_attn entries \
+                 (recorded on '{}') -- GPU not required",
+                db.compute.len(),
+                db.sequence.len(),
+                db.memcpy.len(),
+                db.flash_attn.len(),
+                db.gpu_name,
+            );
+            return (
+                CudaEstimator::new_replay(db.memcpy, db.flash_attn),
+                TorchEstimator::new_replay(db.compute, db.sequence),
+            );
+        }
+
+        let mut cuda = CudaEstimator::new();
+        let mut torch = TorchEstimator::new();
+        if let Some(dir) = &args.record_perf_db {
+            if dir.is_dir() {
+                match PerfDb::load(dir) {
+                    Ok(db) => {
+                        // Preloading merges this run's new shapes into the existing
+                        // DB -- but only the timings of *this* GPU may be added to
+                        // it. Recording into a DB captured on another GPU would
+                        // leave the old entries untouched (they hit the preloaded
+                        // cache and are never re-profiled) while save() restamps
+                        // the manifest with this GPU's name, silently producing a
+                        // DB that blends two GPUs under one label. Refuse instead.
+                        let local = cuda.gpu_name();
+                        if !db.gpu_name.is_empty() && !local.is_empty() && db.gpu_name != local {
+                            panic!(
+                                "perf-db record: {} was recorded on '{}' but this machine is \
+                                 '{}'. Recording would mix timings from two GPUs under one \
+                                 name. Record into a different directory, or delete {} to \
+                                 re-record it from scratch on this GPU.",
+                                dir.display(),
+                                db.gpu_name,
+                                local,
+                                dir.display(),
+                            );
+                        }
+                        log::info!(
+                            "perf-db record: merging into existing DB at {} ({} compute entries, \
+                             recorded on '{}'). Entries already present are NOT re-profiled; \
+                             delete the directory to re-record them.",
+                            dir.display(),
+                            db.compute.len(),
+                            db.gpu_name,
+                        );
+                        cuda.preload(db.memcpy, db.flash_attn);
+                        torch.preload(db.compute, db.sequence);
+                    }
+                    Err(e) => log::warn!(
+                        "perf-db record: could not load existing DB at {} ({e}); starting fresh",
+                        dir.display(),
+                    ),
+                }
+            }
+        }
+        (cuda, torch)
+    }
+
     pub fn new(netsim: netsim::simulator::Simulator) -> Self {
+        let (cuda_estimator, torch_estimator) = Self::build_estimators();
         Simulator {
-            cuda_estimator: CudaEstimator::new(),
-            torch_estimator: TorchEstimator::new(),
+            cuda_estimator,
+            torch_estimator,
 
             queue: EventQueue::new(netsim),
             stream_info: HashMap::new(),
@@ -302,7 +376,14 @@ impl Simulator {
         if calls.is_empty() {
             vec![]
         } else {
-            if args::get_args().disable_sequence_call {
+            let args = args::get_args();
+            // perf-db record/replay forces single-op timing. Sequence grouping
+            // below is timing-dependent (it splits on the simulated clock), so the
+            // groups -- and thus their hashes -- are not reproducible between a
+            // record run and a replay run, causing spurious misses. compute_cache
+            // is keyed purely by op+shape and is deterministic, so the DB is
+            // complete and replay never misses.
+            if args.disable_sequence_call || args.perf_db.is_some() || args.record_perf_db.is_some() {
                 calls
                     .into_iter()
                     .map(|(call, dur)| TorchCallSeq::Single(call, dur))
@@ -1613,5 +1694,94 @@ impl Simulator {
     pub fn handle_exit(&mut self, host: ResponseId, curr_time: i64) {
         log::debug!("{:?} exited at {}", host, curr_time);
         self.exited_hosts.insert(host.host, curr_time);
+
+        // In record mode, dump the profiled timing caches to the DB. Idempotent
+        // overwrite on each rank's exit (runs a handful of times); the last write
+        // holds the full set of shapes seen this run, merged with any preexisting
+        // DB that was preloaded at startup.
+        if let Some(dir) = &args::get_args().record_perf_db {
+            let db = PerfDb {
+                gpu_name: self.cuda_estimator.gpu_name(),
+                compute: self.torch_estimator.compute_cache().clone(),
+                sequence: self.torch_estimator.sequence_cache().clone(),
+                memcpy: self.cuda_estimator.memcpy_cache().clone(),
+                flash_attn: self.cuda_estimator.flash_attn_cache().clone(),
+            };
+            match db.save(dir) {
+                Ok(()) => log::info!(
+                    "perf-db record: wrote {} ({} compute, {} sequence, {} memcpy, {} flash_attn)",
+                    dir.display(),
+                    db.compute.len(),
+                    db.sequence.len(),
+                    db.memcpy.len(),
+                    db.flash_attn.len(),
+                ),
+                Err(e) => log::error!("perf-db record: failed to write {}: {e}", dir.display()),
+            }
+        }
+
+        // In replay mode, report any shapes that weren't in the DB (discovery).
+        // Write them to `<db>.missing/` so they can be profiled on a GPU with
+        // bench.py and merged/contributed back. A run with no misses clears any
+        // stale manifest. The reported numbers are INVALID when misses occurred
+        // (unrecorded ops were charged zero time).
+        if let Some(dir) = &args::get_args().perf_db {
+            let missing_path =
+                std::path::PathBuf::from(format!("{}.missing", dir.display()));
+            let compute: HashMap<_, _> = self
+                .torch_estimator
+                .missing()
+                .iter()
+                .map(|k| (k.clone(), Duration::ZERO))
+                .collect();
+            let memcpy: HashMap<_, _> = self
+                .cuda_estimator
+                .missing_memcpy()
+                .iter()
+                .map(|&k| (k, Duration::ZERO))
+                .collect();
+            let flash_attn: HashMap<_, _> = self
+                .cuda_estimator
+                .missing_flash()
+                .iter()
+                .map(|k| (k.clone(), Duration::ZERO))
+                .collect();
+            if compute.is_empty() && memcpy.is_empty() && flash_attn.is_empty() {
+                let _ = std::fs::remove_dir_all(&missing_path);
+            } else {
+                let db = PerfDb {
+                    gpu_name: String::new(),
+                    compute,
+                    sequence: Default::default(),
+                    memcpy,
+                    flash_attn,
+                };
+                match db.save(&missing_path) {
+                    Ok(()) => {
+                        // Go to stderr as well as the log: this invalidates every
+                        // number the run just printed, and a log::warn! alone is
+                        // invisible when PHANTORA_LOG is set below `warn`.
+                        let msg = format!(
+                            "perf-db replay: {} compute / {} memcpy / {} flash_attn shape(s) were \
+                             NOT in the database -- the simulated numbers from this run are \
+                             INVALID. Wrote the missing shapes to {m}. To complete the DB, profile \
+                             them on a GPU with `python3 tests/perfdb/bench.py --ref {m} --out {d} \
+                             --merge` and re-run (and consider contributing the result back).",
+                            db.compute.len(),
+                            db.memcpy.len(),
+                            db.flash_attn.len(),
+                            m = missing_path.display(),
+                            d = dir.display(),
+                        );
+                        log::warn!("{msg}");
+                        eprintln!("WARNING: {msg}");
+                    }
+                    Err(e) => log::error!(
+                        "perf-db replay: failed to write missing manifest {}: {e}",
+                        missing_path.display()
+                    ),
+                }
+            }
+        }
     }
 }

@@ -53,6 +53,11 @@ pub struct TorchEstimator {
     tensor_cache: LruCache<(i64, Kind), Tensor>,
     compute_cache: HashMap<TorchCallInfo, Duration>,
     sequence_cache: BTreeMap<u64, Vec<Duration>>,
+    // perf-db replay: answer only from the preloaded caches (no GPU). A miss is
+    // recorded here (discovery) and substituted with a zero placeholder so the
+    // run completes and the full set of unrecorded shapes can be reported.
+    replay: bool,
+    missing: Vec<TorchCallInfo>,
 }
 
 impl TorchEstimator {
@@ -64,7 +69,47 @@ impl TorchEstimator {
             tensor_cache: LruCache::new(NonZeroUsize::new(32).unwrap()),
             compute_cache: HashMap::new(),
             sequence_cache: BTreeMap::new(),
+            replay: false,
+            missing: Vec::new(),
         }
+    }
+
+    /// Construct a GPU-less estimator that answers solely from a preloaded
+    /// performance database. No warmup matmul / GPU allocation.
+    pub fn new_replay(
+        compute_cache: HashMap<TorchCallInfo, Duration>,
+        sequence_cache: BTreeMap<u64, Vec<Duration>>,
+    ) -> Self {
+        Self {
+            tensor_cache: LruCache::new(NonZeroUsize::new(32).unwrap()),
+            compute_cache,
+            sequence_cache,
+            replay: true,
+            missing: Vec::new(),
+        }
+    }
+
+    pub fn compute_cache(&self) -> &HashMap<TorchCallInfo, Duration> {
+        &self.compute_cache
+    }
+
+    /// Compute keys requested during replay that were not in the DB (discovery).
+    pub fn missing(&self) -> &[TorchCallInfo] {
+        &self.missing
+    }
+
+    pub fn sequence_cache(&self) -> &BTreeMap<u64, Vec<Duration>> {
+        &self.sequence_cache
+    }
+
+    /// Seed the caches from an existing DB (record mode merges into it).
+    pub fn preload(
+        &mut self,
+        compute: HashMap<TorchCallInfo, Duration>,
+        sequence: BTreeMap<u64, Vec<Duration>>,
+    ) {
+        self.compute_cache.extend(compute);
+        self.sequence_cache.extend(sequence);
     }
 
     fn allocate(&mut self, info: &TensorInfo) -> Tensor {
@@ -538,6 +583,16 @@ impl TorchEstimator {
     pub fn estimate(&mut self, call: &TorchCallInfo) -> Duration {
         if let Some(value) = self.compute_cache.get(call) {
             *value
+        } else if self.replay {
+            // Discovery: record the unrecorded shape and substitute a zero
+            // placeholder so the run finishes and reports every missing shape.
+            // Memoize the placeholder so a recurring miss is recorded exactly
+            // once: a hot op repeats every layer of every step, and a foreach key
+            // holds thousands of TensorInfo, so re-cloning it per call would grow
+            // `missing` until the simulator is OOM-killed.
+            self.missing.push(call.clone());
+            self.compute_cache.insert(call.clone(), Duration::ZERO);
+            Duration::ZERO
         } else {
             let duration = self.run(2, call);
             self.compute_cache.insert(call.clone(), duration);
@@ -556,13 +611,17 @@ impl TorchEstimator {
         };
         if let Some(value) = self.sequence_cache.get(&seq_hash) {
             return value.clone();
-        } else {
-            let mut durs = Vec::new();
-            for call in calls {
-                durs.push(self.run(1, &call.info));
-            }
-            self.sequence_cache.insert(seq_hash, durs.clone());
-            durs
         }
+        if self.replay {
+            // perf-db forces single-op timing, so sequences aren't used in
+            // replay; if one slips through, fall back to per-op discovery.
+            return calls.iter().map(|c| self.estimate(&c.info)).collect();
+        }
+        let mut durs = Vec::new();
+        for call in calls {
+            durs.push(self.run(1, &call.info));
+        }
+        self.sequence_cache.insert(seq_hash, durs.clone());
+        durs
     }
 }

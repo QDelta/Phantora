@@ -4,6 +4,7 @@ pub mod cuda_estimate;
 pub mod cupti;
 pub mod event_queue;
 pub mod nccl_ops;
+pub mod perf_db;
 pub mod simulator;
 pub mod timeline;
 pub mod torch_call;

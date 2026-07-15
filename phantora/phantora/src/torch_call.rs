@@ -1064,6 +1064,9 @@ pub enum TorchCallInfo {
         q: TensorInfo,
         k: TensorInfo,
         v: TensorInfo,
+        // Omit when None so the serialized perf-db key matches the pre-mask
+        // spelling and re-records don't churn (perf_db.rs is the only serializer).
+        #[serde(skip_serializing_if = "Option::is_none")]
         mask: Option<TensorInfo>,
         causal: bool,
         gqa: bool,
@@ -1072,6 +1075,7 @@ pub enum TorchCallInfo {
         q: TensorInfo,
         k: TensorInfo,
         v: TensorInfo,
+        #[serde(skip_serializing_if = "Option::is_none")]
         bias: Option<TensorInfo>,
         causal: bool,
     },
@@ -1089,6 +1093,7 @@ pub enum TorchCallInfo {
     Conv2d {
         input: TensorInfo,
         weight: TensorInfo,
+        #[serde(skip_serializing_if = "Option::is_none")]
         bias: Option<TensorInfo>,
         stride: [i64; 2],
         padding: [i64; 2],
