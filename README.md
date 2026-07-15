@@ -131,7 +131,7 @@ A preset produces a fixed, enumerable set of kernel shapes, so a recorded **perf
 ```bash
 cd tests/docker/megatron
 python3 config_gen.py --nhost 1 --ngpu 2 --vram_mib 81920 --perf-db l40s
-./run.sh ./mixtral/run_mixtral_8x7b.sh --expert_model_parallel_size 2 --sequence_length 1024
+./mixtral/run_mixtral_8x7b.sh --expert_model_parallel_size 2 --sequence_length 1024
 ```
 
 The committed `tests/perfdb/l40s/` (recorded on an NVIDIA L40S) covers each preset **at the exact config [`tests/perfdb/record_all.sh`](tests/perfdb/record_all.sh) recorded it at** — for Mixtral that is the 2-GPU, EP=2, sequence-length-1024 config above, which is why the command differs from the 8-GPU one in the preset's own header. Replaying a *different* config (more GPUs, a longer sequence, a different micro-batch) introduces kernel shapes the database does not have; that is not an error, but the run's numbers are invalid until you complete the database — see the next section. The CSV is human-readable — each row is one `(op, shape) → nanoseconds` entry.
