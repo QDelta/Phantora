@@ -151,6 +151,25 @@ fn compact_value(v: Value) -> Value {
     }
 }
 
+/// Recursively sort object keys so the serialized key is deterministic. The
+/// workspace enables `serde_json`'s `preserve_order` (via the visualizer crate),
+/// so struct variants would otherwise serialize in declaration order and churn
+/// against DBs written before that feature was pulled in; sorting pins them to a
+/// single canonical (alphabetical) order. Load is order-independent, so this only
+/// affects on-disk bytes. Arrays keep their order (tensors are `[code,[dims]]`,
+/// where position is meaningful).
+fn sort_object_keys(v: Value) -> Value {
+    match v {
+        Value::Object(map) => {
+            let sorted: BTreeMap<String, Value> =
+                map.into_iter().map(|(k, val)| (k, sort_object_keys(val))).collect();
+            Value::Object(sorted.into_iter().collect())
+        }
+        Value::Array(arr) => Value::Array(arr.into_iter().map(sort_object_keys).collect()),
+        other => other,
+    }
+}
+
 /// Inverse of `compact_value`. Also tolerates the legacy verbose form (an old
 /// committed DB whose tensors are still `{shape,dtype}` objects loads unchanged).
 fn expand_value(v: Value) -> Value {
@@ -293,8 +312,9 @@ impl PerfDb {
                 .compute
                 .iter()
                 .map(|(k, v)| {
-                    let compact = compact_value(serde_json::to_value(k).unwrap());
-                    (serde_json::to_string(&compact).unwrap(), v.as_nanos())
+                    let canonical =
+                        sort_object_keys(compact_value(serde_json::to_value(k).unwrap()));
+                    (serde_json::to_string(&canonical).unwrap(), v.as_nanos())
                 })
                 .collect();
             rows.sort(); // stable, diff-friendly ordering
@@ -555,6 +575,46 @@ mod tests {
         assert_eq!(loaded.memcpy, db.memcpy);
         assert_eq!(loaded.flash_attn, db.flash_attn);
         assert_eq!(loaded.sequence, db.sequence);
+    }
+
+    #[test]
+    fn canonical_serialization() {
+        // The save path is compact_value -> sort_object_keys -> to_string. Assert
+        // the canonical bytes directly: a None mask is omitted (so the key matches
+        // the pre-mask spelling and re-records don't churn), a Some mask is kept,
+        // and object keys come out sorted regardless of serde_json map ordering.
+        let ser = |call: &TorchCallInfo| {
+            serde_json::to_string(&sort_object_keys(compact_value(
+                serde_json::to_value(call).unwrap(),
+            )))
+            .unwrap()
+        };
+
+        let no_mask = ser(&TorchCallInfo::SDPA {
+            q: ti(&[2, 32, 1024, 128], Kind::BFloat16),
+            k: ti(&[2, 32, 1024, 128], Kind::BFloat16),
+            v: ti(&[2, 32, 1024, 128], Kind::BFloat16),
+            mask: None,
+            causal: true,
+            gqa: false,
+        });
+        assert_eq!(
+            no_mask,
+            r#"{"SDPA":{"causal":true,"gqa":false,"k":["bf16",[2,32,1024,128]],"q":["bf16",[2,32,1024,128]],"v":["bf16",[2,32,1024,128]]}}"#
+        );
+
+        let with_mask = ser(&TorchCallInfo::SDPA {
+            q: ti(&[2, 32, 1024, 128], Kind::BFloat16),
+            k: ti(&[2, 32, 1024, 128], Kind::BFloat16),
+            v: ti(&[2, 32, 1024, 128], Kind::BFloat16),
+            mask: Some(ti(&[2, 1, 1024, 1024], Kind::BFloat16)),
+            causal: false,
+            gqa: false,
+        });
+        assert!(
+            with_mask.contains(r#""mask":["bf16",[2,1,1024,1024]]"#),
+            "Some mask must be kept: {with_mask}"
+        );
     }
 
     // Re-save an existing DB through the current codec (e.g. to migrate it to a
